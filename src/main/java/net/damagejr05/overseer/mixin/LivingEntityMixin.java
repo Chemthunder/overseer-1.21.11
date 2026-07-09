@@ -16,25 +16,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(value = LivingEntity.class)
 public abstract class LivingEntityMixin {
-
-    @Inject(method = "applyMovementInput", at = @At(value = "HEAD"), cancellable = true)
-    private void overseeker$lockMovement(Vec3d movementInput, float slipperiness, CallbackInfoReturnable<Vec3d> cir) {
-        if ((Object) this instanceof PlayerEntity player) {
-            if (OverseerComponent.KEY.get(player).getDeathTicks() > 0) {
-                cir.setReturnValue(Vec3d.ZERO);
-            }
-        }
-    }
-
-    @Inject(method = "applyFluidMovingSpeed", at = @At(value = "HEAD"), cancellable = true)
-    private void overseeker$lockMovementFluid(double gravity, boolean falling, Vec3d motion, CallbackInfoReturnable<Vec3d> cir) {
-        if ((Object) this instanceof PlayerEntity player) {
-            if (OverseerComponent.KEY.get(player).getDeathTicks() > 0) {
-                cir.setReturnValue(Vec3d.ZERO);
-            }
-        }
-    }
-
     @Inject(method = "tryUseDeathProtector", at = @At(value = "HEAD"), cancellable = true)
     private void overseer$transform(DamageSource source, CallbackInfoReturnable<Boolean> cir) {
         if ((Object) this instanceof PlayerEntity player) {

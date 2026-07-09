@@ -5,6 +5,8 @@
   "mixins": [
     "LensFlareRendererMixin",
     "LivingEntityMixin",
+    "MobEntityMixin",
+    "PlayerManagerMixin",
     "StatusEffectUtilMixin"
   ],
   "injectors": {
@@ -15,6 +17,7 @@
   },
   "client": [
     "client.EntityHitboxDebugRendererMixin",
-    "client.EntityRenderManagerMixin"
+    "client.EntityRenderManagerMixin",
+    "client.InGameHudMixin"
   ]
 }

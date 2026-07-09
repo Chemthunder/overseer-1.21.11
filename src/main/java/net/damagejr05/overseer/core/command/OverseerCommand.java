@@ -34,7 +34,7 @@ public class OverseerCommand implements CommandRegistrationCallback {
                     PlayerEntity player = context.getSource().getPlayerOrThrow();
                     OverseerComponent o = OverseerComponent.KEY.get(player);
 
-                    o.setDeathTicks(10 * 20);
+                    o.kill();
                     return 1;
                 }))
                 .then(literal("flicker").then(argument("state", BoolArgumentType.bool()).executes(context -> {
@@ -49,6 +49,13 @@ public class OverseerCommand implements CommandRegistrationCallback {
                     OverseerComponent o = OverseerComponent.KEY.get(player);
 
                     o.setInvisible(BoolArgumentType.getBool(context, "state"));
+                    return 1;
+                })))
+                .then(literal("active").then(argument("state", BoolArgumentType.bool()).executes(context -> {
+                    PlayerEntity player = context.getSource().getPlayerOrThrow();
+                    OverseerComponent o = OverseerComponent.KEY.get(player);
+
+                    o.setActive(BoolArgumentType.getBool(context, "state"));
                     return 1;
                 })))
 

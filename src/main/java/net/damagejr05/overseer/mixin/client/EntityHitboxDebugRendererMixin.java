@@ -17,7 +17,7 @@ public abstract class EntityHitboxDebugRendererMixin {
     @Inject(method = "drawHitbox", at = @At(value = "HEAD"), cancellable = true)
     private void overseer$nohitboxplease(Entity entity, float tickProgress, boolean inLocalServer, CallbackInfo ci) {
         if (entity instanceof PlayerEntity player) {
-            if (OverseerComponent.KEY.get(player).isInvisible()) {
+            if (OverseerComponent.KEY.get(player).isActive()) {
                 ci.cancel();
             }
         }

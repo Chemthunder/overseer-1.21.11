@@ -38,25 +38,15 @@ public class OverseerComponent implements AutoSyncedComponent, CommonTickingComp
     private boolean invisible = false;
     private boolean flicker = false;
 
-    private int deathTicks = 0;
-
     public OverseerComponent(PlayerEntity player) {
         this.player = player;
     }
 
     public void tick() {
-        if (deathTicks > 0) {
-            deathTicks--;
-            if (deathTicks == 0) {
-                kill();
-                sync();
-            }
-        }
-
         if (flicker) {
             List<LivingEntity> surroundings = player.getEntityWorld().getEntitiesByClass(
                     LivingEntity.class,
-                    new Box(player.getBlockPos()).expand(2),
+                    new Box(player.getBlockPos()).expand(1),
                     entity -> entity != player
             );
 
@@ -84,7 +74,7 @@ public class OverseerComponent implements AutoSyncedComponent, CommonTickingComp
 
         if (server != null) {
             server.getPlayerManager().broadcast(
-                    Text.translatable("broadcast.ban.death", player.getNameForScoreboard()).formatted(Formatting.YELLOW),
+                    Text.translatable("broadcast.ban.death", player.getNameForScoreboard()),
                     false
             );
 
@@ -136,15 +126,6 @@ public class OverseerComponent implements AutoSyncedComponent, CommonTickingComp
 
     public void setActive(boolean active) {
         this.active = active;
-        sync();
-    }
-
-    public int getDeathTicks() {
-        return deathTicks;
-    }
-
-    public void setDeathTicks(int deathTicks) {
-        this.deathTicks = deathTicks;
         sync();
     }
 

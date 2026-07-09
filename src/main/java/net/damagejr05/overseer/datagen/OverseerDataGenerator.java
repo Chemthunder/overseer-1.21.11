@@ -1,11 +1,13 @@
 package net.damagejr05.overseer.datagen;
 
+import net.damagejr05.overseer.datagen.providers.ModLanguageProvider;
 import net.fabricmc.fabric.api.datagen.v1.DataGeneratorEntrypoint;
 import net.fabricmc.fabric.api.datagen.v1.FabricDataGenerator;
 
 public class OverseerDataGenerator implements DataGeneratorEntrypoint {
-	@Override
-	public void onInitializeDataGenerator(FabricDataGenerator fabricDataGenerator) {
+	public void onInitializeDataGenerator(FabricDataGenerator fdg) {
+        var pack = fdg.createPack();
 
+        pack.addProvider(ModLanguageProvider::new);
 	}
 }

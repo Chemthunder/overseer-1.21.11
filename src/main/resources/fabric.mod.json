@@ -25,6 +25,7 @@
       "net.damagejr05.overseer.core.cca.ModCCA"
     ]
   },
+  "accessWidener": "overseer.accesswidener",
   "mixins": [
     "overseer.mixins.json"
   ],
@@ -36,7 +37,8 @@
   },
   "custom": {
     "cardinal-components": [
-      "overseer:overseer"
+      "overseer:overseer",
+      "overseer:victim"
     ]
   }
 }
