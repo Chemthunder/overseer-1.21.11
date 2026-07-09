@@ -38,7 +38,8 @@
   "custom": {
     "cardinal-components": [
       "overseer:overseer",
-      "overseer:victim"
+      "overseer:victim",
+      "overseer:doorway"
     ]
   }
 }

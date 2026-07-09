@@ -6,6 +6,7 @@
     "LensFlareRendererMixin",
     "LivingEntityMixin",
     "MobEntityMixin",
+    "PlayerEntityMixin",
     "PlayerManagerMixin",
     "StatusEffectUtilMixin"
   ],
@@ -18,6 +19,7 @@
   "client": [
     "client.EntityHitboxDebugRendererMixin",
     "client.EntityRenderManagerMixin",
-    "client.InGameHudMixin"
+    "client.InGameHudMixin",
+    "client.PlayerListHudMixin"
   ]
 }

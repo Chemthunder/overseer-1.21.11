@@ -19,9 +19,7 @@ import java.util.List;
  */
 @Mixin(PlayerManager.class)
 public abstract class PlayerManagerMixin {
-    @Shadow
-    @Final
-    private List<ServerPlayerEntity> players;
+    @Shadow @Final private List<ServerPlayerEntity> players;
 
     @WrapWithCondition(
             method = "onPlayerConnect",
