@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "overseer",
+  "version": "${version}",
+  "name": "Overseer",
+  "description": "",
+  "authors": [
+    ""
+  ],
+  "contact": {
+    "homepage": "https://fabricmc.net/",
+    "sources": "https://github.com/FabricMC/fabric-example-mod"
+  },
+  "license": "ARR (Do Not Distribute!)",
+  "icon": "assets/overseer/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "net.damagejr05.overseer.core.Overseer"
+    ],
+    "fabric-datagen": [
+      "net.damagejr05.overseer.datagen.OverseerDataGenerator"
+    ],
+    "cardinal-components": [
+      "net.damagejr05.overseer.core.cca.ModCCA"
+    ]
+  },
+  "mixins": [
+    "overseer.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.11",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "custom": {
+    "cardinal-components": [
+      "overseer:overseer"
+    ]
+  }
+}
