@@ -41,9 +41,15 @@ public class DoorwayComponent implements AutoSyncedComponent {
     }
 
     public void writeData(WriteView writeView) {
-        writeView.put("FixedPos", Vec3d.CODEC, fixedPos);
-        writeView.put("DoorwayPos", Vec3d.CODEC, doorwayPos);
-        writeView.put("LastDoorwayPos", Vec3d.CODEC, lastDoorwayPos);
+        if (fixedPos != null) {
+            writeView.put("FixedPos", Vec3d.CODEC, fixedPos);
+        }
+        if (doorwayPos != null) {
+            writeView.put("DoorwayPos", Vec3d.CODEC, doorwayPos);
+        }
+        if (lastDoorwayPos != null) {
+            writeView.put("LastDoorwayPos", Vec3d.CODEC, lastDoorwayPos);
+        }
 
         writeView.putInt("DoorwayDuration", doorwayDuration);
     }

@@ -21,25 +21,25 @@ import java.util.List;
 public abstract class PlayerManagerMixin {
     @Shadow @Final private List<ServerPlayerEntity> players;
 
-    @WrapWithCondition(
-            method = "onPlayerConnect",
-            at = @At(
-                    value = "INVOKE",
-                    target = "Lnet/minecraft/server/PlayerManager;broadcast(Lnet/minecraft/text/Text;Z)V"
-            )
-    )
-    private boolean mindsEye$dontAnnounceEthosJoin(PlayerManager instance, Text message, boolean overlay, ClientConnection connection, ServerPlayerEntity player) {
-        return !OverseerComponent.KEY.get(instance).isActive();
-    }
-
-    @ModifyReturnValue(method = "getPlayerNames", at = @At("RETURN"))
-    private String[] mindsEye$excludeEthosFromTabList(String[] original) {
-        for (int i = 0; i < this.players.size(); i++) {
-            if (!OverseerComponent.KEY.get(this.players.get(i)).isActive()) {
-                original[i] = this.players.get(i).getGameProfile().name();
-            }
-        }
-
-        return original;
-    }
+//    @WrapWithCondition(
+//            method = "onPlayerConnect",
+//            at = @At(
+//                    value = "INVOKE",
+//                    target = "Lnet/minecraft/server/PlayerManager;broadcast(Lnet/minecraft/text/Text;Z)V"
+//            )
+//    )
+//    private boolean mindsEye$dontAnnounceEthosJoin(PlayerManager instance, Text message, boolean overlay, ClientConnection connection, ServerPlayerEntity player) {
+//        return !OverseerComponent.KEY.get(instance).isActive();
+//    }
+//
+//    @ModifyReturnValue(method = "getPlayerNames", at = @At("RETURN"))
+//    private String[] mindsEye$excludeEthosFromTabList(String[] original) {
+//        for (int i = 0; i < this.players.size(); i++) {
+//            if (!OverseerComponent.KEY.get(this.players.get(i)).isActive()) {
+//                original[i] = this.players.get(i).getGameProfile().name();
+//            }
+//        }
+//
+//        return original;
+//    }
 }

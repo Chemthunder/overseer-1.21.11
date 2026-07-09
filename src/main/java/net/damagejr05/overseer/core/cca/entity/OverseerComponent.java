@@ -1,13 +1,10 @@
 package net.damagejr05.overseer.core.cca.entity;
 
 import dev.rbn.chroma.client.screenshake.Screenshake;
-import dev.rbn.chroma.client.screenshake.ScreenshakeInstance;
 import net.damagejr05.overseer.core.Overseer;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.particle.ParticleTypes;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.world.ServerWorld;
 import net.minecraft.storage.ReadView;
 import net.minecraft.storage.WriteView;
 import net.minecraft.text.Text;
@@ -25,7 +22,6 @@ import java.util.List;
 /**
  * @author Chemthunder
  */
-@SuppressWarnings("BooleanMethodIsAlwaysInverted")
 public class OverseerComponent implements AutoSyncedComponent, CommonTickingComponent {
     public static final ComponentKey<OverseerComponent> KEY = ComponentRegistry.getOrCreate(
             Overseer.id("overseer"),

@@ -23,7 +23,7 @@ public abstract class LivingEntityMixin {
 
             if (o.isPrimed() && !o.isActive()) {
                 o.kill();
-                cir.setReturnValue(false);
+                cir.setReturnValue(true);
             }
         }
     }
