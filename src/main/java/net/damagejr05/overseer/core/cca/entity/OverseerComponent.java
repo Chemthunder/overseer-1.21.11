@@ -29,6 +29,8 @@ public class OverseerComponent implements AutoSyncedComponent, CommonTickingComp
     );
     private final PlayerEntity player;
 
+    public static final Text DISPLAY_NAME = Text.literal("The Overseer").formatted(Formatting.BOLD, Formatting.OBFUSCATED, Formatting.ITALIC);
+
     private boolean primed = false;
     private boolean active = false;
     private boolean invisible = false;

@@ -5,18 +5,18 @@
   "name": "Overseer",
   "description": "",
   "authors": [
-    ""
+    "DamageJr05",
+    "Chemthunder"
   ],
-  "contact": {
-    "homepage": "https://fabricmc.net/",
-    "sources": "https://github.com/FabricMC/fabric-example-mod"
-  },
   "license": "ARR (Do Not Distribute!)",
   "icon": "assets/overseer/icon.png",
   "environment": "*",
   "entrypoints": {
     "main": [
       "net.damagejr05.overseer.core.Overseer"
+    ],
+    "client": [
+      "net.damagejr05.overseer.core.OverseerClient"
     ],
     "fabric-datagen": [
       "net.damagejr05.overseer.datagen.OverseerDataGenerator"
@@ -39,7 +39,8 @@
     "cardinal-components": [
       "overseer:overseer",
       "overseer:victim",
-      "overseer:doorway"
+      "overseer:doorway",
+      "overseer:portal"
     ]
   }
 }

@@ -1,8 +1,10 @@
 package net.damagejr05.overseer.core.cca;
 
 import net.damagejr05.overseer.core.cca.entity.OverseerComponent;
+import net.damagejr05.overseer.core.cca.entity.PortalComponent;
 import net.damagejr05.overseer.core.cca.entity.VictimComponent;
 import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
+import net.minecraft.entity.LivingEntity;
 import org.ladysnake.cca.api.v3.entity.EntityComponentFactoryRegistry;
 import org.ladysnake.cca.api.v3.entity.EntityComponentInitializer;
 import org.ladysnake.cca.api.v3.entity.RespawnCopyStrategy;
@@ -25,6 +27,11 @@ public class ModCCA implements EntityComponentInitializer, WorldComponentInitial
                 VictimComponent::new,
                 RespawnCopyStrategy.ALWAYS_COPY
         );
+
+        module.beginRegistration(
+                LivingEntity.class,
+                PortalComponent.KEY
+        ).respawnStrategy(RespawnCopyStrategy.ALWAYS_COPY).end(PortalComponent::new);
     }
 
     public void registerWorldComponentFactories(WorldComponentFactoryRegistry module) {
