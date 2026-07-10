@@ -6,7 +6,6 @@ import net.damagejr05.overseer.core.cca.entity.OverseerComponent;
 import net.damagejr05.overseer.core.cca.entity.VictimComponent;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.Frustum;
-import net.minecraft.client.render.debug.EntityHitboxDebugRenderer;
 import net.minecraft.client.render.entity.EntityRenderManager;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.PlayerEntity;
