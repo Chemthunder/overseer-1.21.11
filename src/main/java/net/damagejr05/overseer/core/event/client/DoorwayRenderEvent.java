@@ -6,8 +6,7 @@ import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.render.RenderLayers;
-import net.minecraft.client.render.VertexConsumerProvider;
+import net.minecraft.client.render.*;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.math.Easing;
 import net.minecraft.util.math.MathHelper;
@@ -36,15 +35,12 @@ public class DoorwayRenderEvent implements WorldRenderEvents.AfterEntities {
             float delta = MinecraftClient.getInstance().getRenderTickCounter().getDynamicDeltaTicks();
 
             float width = MathHelper.clamp(Easing.inOutCubic(doorway.getDoorwayWidth()), 0, 1.0F);
-            float height = 7;
+            float height = 2;
 
             float additional = 0.4F;
             float additional2 = 0;
 
-
             {
-
-
                 Nitro.quad(
                         matrices.peek(),
                         consumers.getBuffer(RenderLayers.entityTranslucentEmissive(Overseer.id("textures/render/white.png"), true)),
