@@ -10,6 +10,7 @@ import net.minecraft.client.render.*;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.util.math.Easing;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.RotationAxis;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 
@@ -30,8 +31,6 @@ public class DoorwayRenderEvent implements WorldRenderEvents.AfterEntities {
             VertexConsumerProvider consumers = worldRenderContext.consumers();
             MatrixStack matrices = worldRenderContext.matrices();
 
-            matrices.push();
-
             float delta = MinecraftClient.getInstance().getRenderTickCounter().getDynamicDeltaTicks();
 
             float width = MathHelper.clamp(Easing.inOutCubic(doorway.getDoorwayWidth()), 0, 1.0F);
@@ -40,6 +39,7 @@ public class DoorwayRenderEvent implements WorldRenderEvents.AfterEntities {
             float additional = 0.4F;
             float additional2 = 0;
 
+            matrices.push();
             {
                 Nitro.quad(
                         matrices.peek(),

@@ -1,5 +1,6 @@
 package dev.rbn.nitrogen;
 
+import net.minecraft.client.render.LightmapTextureManager;
 import net.minecraft.client.render.OverlayTexture;
 import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.util.math.MatrixStack;
@@ -349,7 +350,7 @@ public class Nitro {
                 .color(1.0f, 1.0f, 1.0f, 1.0f) // White color for textures
                 .texture(u, v)
                 .overlay(OverlayTexture.DEFAULT_UV)
-                .light(0xF000F0)
+                .light(LightmapTextureManager.MAX_LIGHT_COORDINATE)
                 .normal(matrix, 0, 1, 0);
     }
 
@@ -358,7 +359,7 @@ public class Nitro {
                 .color(red, green, blue, alpha)
                 .texture(u, v)
                 .overlay(OverlayTexture.DEFAULT_UV)
-                .light(0xF000F0)
+                .light(LightmapTextureManager.MAX_LIGHT_COORDINATE)
                 .normal(matrix, 0, 1, 0);
     }
 

@@ -36,7 +36,7 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
     public void tick() {
         DoorwayComponent doorways = DoorwayComponent.KEY.get(living.getEntityWorld());
 
-        ParticleEffect hitboxParticle = new DustParticleEffect(0xFFff0000, 6);
+        ParticleEffect hitboxParticle = new DustParticleEffect(0xff0000, 3);
 
         if (living.getEntityWorld().getServer() != null) {
             ServerWorld overworld = living.getEntityWorld().getServer().getOverworld();
