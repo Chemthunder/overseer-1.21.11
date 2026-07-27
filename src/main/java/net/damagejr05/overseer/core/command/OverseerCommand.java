@@ -87,10 +87,17 @@ public class OverseerCommand implements CommandRegistrationCallback {
 
                             doorways.setDoorwayDuration(time * 20);
                             doorways.setDoorwayWidth(0.0F);
-                            doorways.setDoorwayRot(new Random().nextFloat(-180, 180));
                             doorways.setDoorwayPos(pos.toCenterPos());
                             return 1;
                         }))))
+                        .then(literal("destroy").executes(context -> {
+                            DoorwayComponent doorways = DoorwayComponent.KEY.get(context.getSource().getWorld());
+
+                            doorways.setDoorwayPos(null);
+                            doorways.setDoorwayDuration(0);
+                            doorways.setDoorwayWidth(0);
+                            return 1;
+                        }))
                 )
         );
     }

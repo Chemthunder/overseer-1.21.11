@@ -31,59 +31,69 @@ public class DoorwayRenderEvent implements WorldRenderEvents.AfterEntities {
             VertexConsumerProvider consumers = worldRenderContext.consumers();
             MatrixStack matrices = worldRenderContext.matrices();
 
-            float delta = MinecraftClient.getInstance().getRenderTickCounter().getDynamicDeltaTicks();
-
             float width = MathHelper.clamp(Easing.inOutCubic(doorway.getDoorwayWidth()), 0, 1.0F);
             float height = 2;
 
-            float additional = 0.4F;
+            float additional = 0.2F;
             float additional2 = 0;
 
             matrices.push();
+
             {
+                matrices.translate(x, y, z);
+
                 Nitro.quad(
                         matrices.peek(),
-                        consumers.getBuffer(RenderLayers.entityTranslucentEmissive(Overseer.id("textures/render/white.png"), true)),
-                        x - (width + additional),
-                        y,
-                        z,
+                        consumers.getBuffer(RenderLayers.endGateway()),
+                        0 - (width + additional2),
+                        0,
+                        0,
 
-                        x,
-                        y + (height + 1),
-                        z,
+                        0,
+                        0 + height,
+                        0,
 
-                        x + (width + additional),
-                        y,
-                        z,
+                        0 + (width + additional2),
+                        0,
+                        0,
 
-                        x,
-                        y - (height + 1),
-                        z,
+                        0,
+                        0 - height,
+                        0,
 
                         1,
                         1,
                         1,
                         1
                 );
+            }
+
+            matrices.pop();
+
+            matrices.push();
+
+            {
+                matrices.multiply(RotationAxis.POSITIVE_Y.rotationDegrees(180), x, y, z);
+                matrices.translate(x, y, z);
 
                 Nitro.quad(
                         matrices.peek(),
                         consumers.getBuffer(RenderLayers.endGateway()),
-                        x - (width + additional2),
-                        y,
-                        z,
+                        0 - (width + additional2),
+                        0,
+                        0,
 
-                        x,
-                        y + height,
-                        z,
+                        0,
+                        0 + height,
+                        0,
 
-                        x + (width + additional2),
-                        y,
-                        z,
+                        0 + (width + additional2),
+                        0,
+                        0,
 
-                        x,
-                        y - height,
-                        z,
+                        0,
+                        0 - height,
+                        0,
 
                         1,
                         1,

@@ -1,6 +1,7 @@
 package net.damagejr05.overseer.core.cca.world;
 
 import net.damagejr05.overseer.core.Overseer;
+import net.damagejr05.overseer.core.OverseerClient;
 import net.minecraft.particle.ParticleTypes;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.storage.ReadView;
@@ -20,8 +21,6 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
     );
     private final World world;
 
-    public static final float MAX_DOORWAY_WIDTH = 3.0F;
-
     private @Nullable Vec3d fixedPos = null;
     private @Nullable Vec3d doorwayPos = null;
 
@@ -30,14 +29,29 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
     private int doorwayDuration = 0;
 
     private float doorwayWidth = 0.0F;
-    private float doorwayRot = 0.0F;
 
     public DoorwayComponent(World world) {
         this.world = world;
     }
 
     public void tick() {
-//        doorwayWidth = MathHelper.clamp(doorwayWidth, 0.0F, MAX_DOORWAY_WIDTH);
+        if (fixedPos != null) {
+            if (OverseerClient.age % 50 == 0) {
+                if (world instanceof ServerWorld serverWorld) {
+                    serverWorld.spawnParticles(
+                            ParticleTypes.END_ROD,
+                            fixedPos.x,
+                            fixedPos.y,
+                            fixedPos.z,
+                            3,
+                            0,
+                            0,
+                            0,
+                            0.1F
+                    );
+                }
+            }
+        }
 
         if (doorwayWidth < 3.0F) {
             doorwayWidth += 0.05F;
@@ -49,23 +63,25 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
         if (doorwayDuration > 0) {
             doorwayDuration--;
             if (doorwayDuration == 0) {
-                if (world instanceof ServerWorld serverWorld) {
-                    serverWorld.spawnParticles(
-                            ParticleTypes.END_ROD,
-                            doorwayPos.x,
-                            doorwayPos.y,
-                            doorwayPos.z,
-                            15,
-                            0,
-                            0,
-                            0,
-                            0.3F
-                    );
-                }
+                if (doorwayPos != null) {
+                    if (world instanceof ServerWorld serverWorld) {
+                        serverWorld.spawnParticles(
+                                ParticleTypes.END_ROD,
+                                doorwayPos.x,
+                                doorwayPos.y,
+                                doorwayPos.z,
+                                15,
+                                0,
+                                0,
+                                0,
+                                0.3F
+                        );
+                    }
 
-                lastDoorwayPos = doorwayPos;
-                doorwayPos = null;
-                sync();
+                    lastDoorwayPos = doorwayPos;
+                    doorwayPos = null;
+                    sync();
+                }
             }
         }
     }
@@ -81,7 +97,6 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
 
         doorwayDuration = readView.getInt("DoorwayDuration", 0);
         doorwayWidth = readView.getFloat("DoorwayWidth", 0.0F);
-        doorwayRot = readView.getFloat("DoorwayRot", 0.0F);
     }
 
     public void writeData(WriteView writeView) {
@@ -97,7 +112,6 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
 
         writeView.putInt("DoorwayDuration", doorwayDuration);
         writeView.putFloat("DoorwayWidth", doorwayWidth);
-        writeView.putFloat("DoorwayRot", doorwayRot);
     }
 
     public @Nullable Vec3d getFixedPos() {
@@ -142,15 +156,6 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
 
     public void setDoorwayWidth(float doorwayWidth) {
         this.doorwayWidth = doorwayWidth;
-        sync();
-    }
-
-    public float getDoorwayRot() {
-        return doorwayRot;
-    }
-
-    public void setDoorwayRot(float doorwayRot) {
-        this.doorwayRot = doorwayRot;
         sync();
     }
 }
