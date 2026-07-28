@@ -23,7 +23,7 @@ public abstract class InGameHudMixin {
 
         if (player != null) {
             if (OverseerComponent.KEY.get(player).isActive()) {
-                if (instance != InGameHud.HeartType.ABSORBING && instance != InGameHud.HeartType.POISONED && instance != InGameHud.HeartType.WITHERED) {
+                if (instance != InGameHud.HeartType.CONTAINER && instance != InGameHud.HeartType.ABSORBING && instance != InGameHud.HeartType.POISONED && instance != InGameHud.HeartType.WITHERED) {
                     if (blinking) {
                         if (half) {
                             return id("hud/heart/seer_half_blinking");
