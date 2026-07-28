@@ -1,6 +1,5 @@
 package net.damagejr05.overseer.core.cca.entity;
 
-import dev.rbn.chroma.client.screenshake.Screenshake;
 import net.damagejr05.overseer.core.Overseer;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.player.PlayerEntity;
@@ -11,7 +10,6 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.Box;
 import net.minecraft.world.World;
-import net.minecraft.world.attribute.timeline.EasingType;
 import org.ladysnake.cca.api.v3.component.ComponentKey;
 import org.ladysnake.cca.api.v3.component.ComponentRegistry;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
@@ -65,10 +63,6 @@ public class OverseerComponent implements AutoSyncedComponent, CommonTickingComp
     public void kill() {
         World world = player.getEntityWorld();
         MinecraftServer server = world.getServer();
-
-        world.getPlayers().forEach(capture -> {
-            Screenshake.getInstance().screenshake(1.0F, 60, EasingType.OUT_ELASTIC);
-        });
 
         if (server != null) {
             server.getPlayerManager().broadcast(

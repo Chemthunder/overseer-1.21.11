@@ -20,8 +20,8 @@ public abstract class LivingEntityMixin {
             OverseerComponent o = OverseerComponent.KEY.get(player);
 
             if (o.isPrimed() && !o.isActive()) {
-                o.kill();
                 cir.setReturnValue(true);
+                o.kill();
             }
         }
     }

@@ -6,6 +6,7 @@ import net.minecraft.particle.ParticleTypes;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.storage.ReadView;
 import net.minecraft.storage.WriteView;
+import net.minecraft.util.math.RotationAxis;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.World;
 import org.jetbrains.annotations.Nullable;
@@ -23,12 +24,15 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
 
     private @Nullable Vec3d fixedPos = null;
     private @Nullable Vec3d doorwayPos = null;
-
     private @Nullable Vec3d lastDoorwayPos = null;
 
     private int doorwayDuration = 0;
-
     private float doorwayWidth = 0.0F;
+
+    private boolean preview = false;
+    
+    private RotationAxis rotationAxis = RotationAxis.POSITIVE_X;
+    private float rotation = 0.0F;
 
     public DoorwayComponent(World world) {
         this.world = world;

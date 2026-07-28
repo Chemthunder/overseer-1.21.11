@@ -3,7 +3,6 @@
   "package": "net.damagejr05.overseer.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
-    "LensFlareRendererMixin",
     "LivingEntityMixin",
     "MobEntityMixin",
     "PlayerEntityMixin",
