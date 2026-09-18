@@ -1,0 +1,22 @@
+{
+  "type": "overseer:memory",
+  "generator": {
+    "type": "minecraft:flat",
+    "settings": {
+      "biome": "overseer:memory",
+      "lakes": false,
+      "features": false,
+      "layers": [
+        {
+          "block": "minecraft:air",
+          "height": 64
+        },
+        {
+          "block": "overseer:void_matter",
+          "height": 4
+        }
+      ],
+      "structure_overrides": []
+    }
+  }
+}

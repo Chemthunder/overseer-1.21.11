@@ -2,119 +2,147 @@ package net.damagejr05.overseer.core.cca.entity;
 
 import net.damagejr05.overseer.core.Overseer;
 import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.entity.LivingEntity;
-import net.minecraft.particle.DustParticleEffect;
-import net.minecraft.particle.ParticleEffect;
+import net.damagejr05.overseer.core.portal.PortalAnchor;
+import net.damagejr05.overseer.core.portal.PortalCrossing;
+import net.damagejr05.overseer.core.portal.PortalPair;
+import net.damagejr05.overseer.core.portal.PortalTransform;
+import net.damagejr05.overseer.core.net.PortalTransitionPayload;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.storage.ReadView;
 import net.minecraft.storage.WriteView;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.TeleportTarget;
-import net.minecraft.world.World;
+import org.jetbrains.annotations.Nullable;
 import org.ladysnake.cca.api.v3.component.ComponentKey;
 import org.ladysnake.cca.api.v3.component.ComponentRegistry;
 import org.ladysnake.cca.api.v3.component.sync.AutoSyncedComponent;
 import org.ladysnake.cca.api.v3.component.tick.CommonTickingComponent;
 
+/**
+ * Moves a player through the portal pair.
+ *
+ * <p>Crossing is detected by sweeping the player's movement for this tick against the portal quad
+ * rather than testing whether they are standing in a box, so it fires at the exact moment of
+ * passage and cannot be tunnelled through at speed.
+ *
+ * @author Chemthunder, Flex
+ */
 public class PortalComponent implements AutoSyncedComponent, CommonTickingComponent {
     public static final ComponentKey<PortalComponent> KEY = ComponentRegistry.getOrCreate(
             Overseer.id("portal"),
             PortalComponent.class
     );
-    private final LivingEntity living;
 
-    private int portalCooldown = 0;
+    private final PlayerEntity player;
 
-    public PortalComponent(LivingEntity living) {
-        this.living = living;
+    /** Body-centre position last tick, used as the start of the swept segment. */
+    private @Nullable Vec3d previousPos = null;
+
+    public PortalComponent(PlayerEntity player) {
+        this.player = player;
     }
 
     public void tick() {
-        DoorwayComponent doorways = DoorwayComponent.KEY.get(living.getEntityWorld());
+        Vec3d current = samplePos();
 
-        ParticleEffect hitboxParticle = new DustParticleEffect(0xff0000, 3);
+        Vec3d previous = previousPos;
+        previousPos = current;
 
-        if (living.getEntityWorld().getServer() != null) {
-            ServerWorld overworld = living.getEntityWorld().getServer().getOverworld();
-
-            if (doorways.getDoorwayPos() != null) {
-                Vec3d pos = doorways.getDoorwayPos();
-
-                Box collider = new Box(new BlockPos.Mutable(pos.x, pos.y, pos.z)).expand(1.5F, 3F, 0.1F);
-
-                if (!living.isInCreativeMode()) {
-                    if (collider.contains(living.getEntityPos()) && portalCooldown <= 0) {
-                        if (doorways.getFixedPos() != null) {
-                            Vec3d fPos = doorways.getFixedPos();
-
-                            living.teleportTo(new TeleportTarget(
-                                    overworld,
-                                    fPos,
-                                    living.getVelocity(),
-                                    living.getYaw(),
-                                    living.getPitch(),
-                                    TeleportTarget.NO_OP
-                            ));
-                            portalCooldown = 90;
-                            sync();
-                        }
-                    }
-                }
-            }
-
-            if (doorways.getFixedPos() != null) {
-                Vec3d pos = doorways.getFixedPos();
-
-                Box collider = new Box(new BlockPos.Mutable(pos.x, pos.y, pos.z)).expand(1F, 1F, 1F);
-
-                if (!living.isInCreativeMode()) {
-                    if (collider.contains(living.getEntityPos()) && portalCooldown <= 0) {
-                        Vec3d fPos = null;
-
-                        if (doorways.getDoorwayPos() != null) {
-                            fPos = doorways.getDoorwayPos();
-                        } else {
-                            if (doorways.getLastDoorwayPos() != null) {
-                                fPos = doorways.getLastDoorwayPos();
-                            }
-                        }
-
-                        living.teleportTo(new TeleportTarget(
-                                overworld,
-                                fPos,
-                                living.getVelocity(),
-                                living.getYaw(),
-                                living.getPitch(),
-                                TeleportTarget.NO_OP
-                        ));
-
-                        portalCooldown = 90;
-                        sync();
-                    }
-                }
-            }
+        if (previous == null || player.getEntityWorld().isClient()) {
+            return;
         }
 
-        if (portalCooldown > 0) {
-            portalCooldown--;
-            if (portalCooldown == 0) {
-                sync();
+        MinecraftServer server = player.getEntityWorld().getServer();
+        if (server == null) {
+            return;
+        }
+
+        // Portals are visible to everyone but only the Overseer may pass through them.
+        if (!Overseer.isOverseer(player)) {
+            return;
+        }
+
+        DoorwayComponent doorways = DoorwayComponent.get(server);
+
+        // Each pair has an end in this dimension at most once, so at most one crossing can fire.
+        for (PortalPair pair : doorways.pairs()) {
+            PortalTransform transform = pair.from(player.getEntityWorld().getRegistryKey());
+
+            if (transform != null && tryCross(server, transform, previous, current)) {
+                return;
             }
         }
+    }
+
+    private boolean tryCross(MinecraftServer server, PortalTransform transform, Vec3d previous, Vec3d current) {
+        PortalAnchor entry = transform.from();
+
+        if (player.getEntityWorld().getRegistryKey() != entry.dimension()) {
+            return false;
+        }
+
+        if (PortalCrossing.find(entry, previous, current) == null) {
+            return false;
+        }
+
+        ServerWorld destination = server.getWorld(transform.to().dimension());
+        if (destination == null) {
+            Overseer.LOGGER.warn("Portal destination dimension {} is not loaded", transform.to().dimension().getValue());
+            return false;
+        }
+
+        Vec3d exitCentre = transform.applyPoint(current);
+        Vec3d exitVelocity = transform.applyVector(player.getVelocity());
+
+        // samplePos() works from the body centre, so undo that offset to get a feet position.
+        Vec3d exitFeet = exitCentre.subtract(0, player.getHeight() / 2.0, 0);
+
+        // Pull the arrival chunk in synchronously. Chunk tickets load asynchronously, so without
+        // this the player can land in a chunk that has not finished loading, drop straight through
+        // the floor that is about to exist, and die in the void.
+        destination.getChunk(BlockPos.ofFloored(exitFeet));
+
+        // Warn the client before the dimension change lands, so it can skip the loading screen.
+        if (player instanceof ServerPlayerEntity serverPlayer) {
+            ServerPlayNetworking.send(serverPlayer, PortalTransitionPayload.INSTANCE);
+        }
+
+        player.teleportTo(new TeleportTarget(
+                destination,
+                exitFeet,
+                exitVelocity,
+                transform.applyYaw(player.getYaw()),
+                player.getPitch(),
+                TeleportTarget.NO_OP
+        ));
+
+        // Carry momentum across the seam; teleportTo alone does not preserve fall distance state.
+        player.setVelocity(exitVelocity);
+        player.fallDistance = 0.0;
+
+        // The swept segment must not span the teleport, or the next tick would look like a huge
+        // jump straight back through the exit portal.
+        previousPos = samplePos();
+
+        return true;
+    }
+
+    private Vec3d samplePos() {
+        return player.getEntityPos().add(0, player.getHeight() / 2.0, 0);
     }
 
     public void sync() {
-        KEY.sync(living);
+        KEY.sync(player);
     }
 
     public void readData(ReadView readView) {
-        portalCooldown = readView.getInt("PortalCooldown", 0);
     }
 
     public void writeData(WriteView writeView) {
-        writeView.putInt("PortalCooldown", portalCooldown);
     }
 }

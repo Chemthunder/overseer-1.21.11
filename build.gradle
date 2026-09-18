@@ -38,6 +38,12 @@ repositories {
         name = "Ladysnake Mods"
         url = 'https://maven.ladysnake.org/releases'
     }
+
+    // Nebulon
+    maven {
+        name = "RiftRealms"
+        url = 'https://maven.riftrealms.de/releases'
+    }
 }
 
 fabricApi {
@@ -61,6 +67,7 @@ dependencies {
 
     // Libraries
     modImplementation "maven.modrinth:acornlib:${project.acornlib_version}"
+    modImplementation "de.nexusrealms:nebulon:${project.nebulon_version}"
 
     // Config
     modApi "com.terraformersmc:modmenu:${project.modmenu_version}"

@@ -28,10 +28,13 @@ public class ModCCA implements EntityComponentInitializer, WorldComponentInitial
                 RespawnCopyStrategy.ALWAYS_COPY
         );
 
-        module.beginRegistration(
-                LivingEntity.class,
-                PortalComponent.KEY
-        ).respawnStrategy(RespawnCopyStrategy.ALWAYS_COPY).end(PortalComponent::new);
+        // Only players traverse portals, so registering this on every LivingEntity was pure tick
+        // cost on every mob in the world.
+        module.registerForPlayers(
+                PortalComponent.KEY,
+                PortalComponent::new,
+                RespawnCopyStrategy.ALWAYS_COPY
+        );
     }
 
     public void registerWorldComponentFactories(WorldComponentFactoryRegistry module) {

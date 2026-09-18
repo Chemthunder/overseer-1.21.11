@@ -33,7 +33,8 @@
     "fabricloader": ">=0.15.11",
     "minecraft": "~1.21.11",
     "java": ">=21",
-    "fabric-api": "*"
+    "fabric-api": "*",
+    "nebulon": ">=0.1.1-beta"
   },
   "custom": {
     "cardinal-components": [

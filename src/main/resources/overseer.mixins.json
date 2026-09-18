@@ -7,6 +7,7 @@
     "MobEntityMixin",
     "PlayerEntityMixin",
     "PlayerManagerMixin",
+    "ServerCommonNetworkHandlerMixin",
     "StatusEffectUtilMixin"
   ],
   "injectors": {
@@ -17,7 +18,10 @@
   },
   "client": [
     "client.EntityHitboxDebugRendererMixin",
+    "client.ClientPlayNetworkHandlerMixin",
     "client.EntityRenderManagerMixin",
+    "client.GameRendererMixin",
+    "client.NebulonClientMixin",
     "client.InGameHudMixin",
     "client.PlayerListHudMixin"
   ]

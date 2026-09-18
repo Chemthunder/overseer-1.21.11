@@ -1,3 +1,38 @@
 accessWidener v1 named
 
 accessible class net/minecraft/client/gui/hud/InGameHud$HeartType
+
+# Multi-world client: secondary ClientWorlds need the active world and renderer swapped in
+# temporarily so vanilla packet handlers apply to the right dimension.
+mutable field net/minecraft/client/MinecraftClient worldRenderer Lnet/minecraft/client/render/WorldRenderer;
+accessible field net/minecraft/client/network/ClientPlayNetworkHandler world Lnet/minecraft/client/world/ClientWorld;
+mutable field net/minecraft/client/network/ClientPlayNetworkHandler world Lnet/minecraft/client/world/ClientWorld;
+
+# A secondary world must be built with the same biome zoom seed as the primary, or biome tinting
+# (grass, foliage, water) would differ between the real world and the one seen through a portal.
+accessible field net/minecraft/world/biome/source/BiomeAccess seed J
+accessible field net/minecraft/client/world/ClientWorld$Properties flatWorld Z
+
+# ParticleManager.setWorld() clears every live particle. The world swap happens on every redirected
+# packet, so calling it there wipes particles constantly -- set the field directly instead.
+accessible field net/minecraft/client/particle/ParticleManager world Lnet/minecraft/client/world/ClientWorld;
+mutable field net/minecraft/client/particle/ParticleManager world Lnet/minecraft/client/world/ClientWorld;
+
+# See-through portals: the far side is rendered from a virtual camera into an offscreen target, so
+# the world renderer's output framebuffer and the camera's placement both have to be steerable.
+accessible field net/minecraft/client/MinecraftClient framebuffer Lnet/minecraft/client/gl/Framebuffer;
+mutable field net/minecraft/client/MinecraftClient framebuffer Lnet/minecraft/client/gl/Framebuffer;
+accessible method net/minecraft/client/render/Camera setPos (Lnet/minecraft/util/math/Vec3d;)V
+accessible method net/minecraft/client/render/Camera setRotation (FF)V
+accessible field net/minecraft/client/render/GameRenderer pool Lnet/minecraft/client/util/memory/ObjectPool;
+accessible field net/minecraft/client/render/GameRenderer fogRenderer Lnet/minecraft/client/render/fog/FogRenderer;
+accessible method net/minecraft/client/render/GameRenderer getFov (Lnet/minecraft/client/render/Camera;FZ)F
+accessible method net/minecraft/client/render/GameRenderer getProjectionMatrix (F)Lorg/joml/Matrix4f;
+
+# Sky and fog colour are read from the camera's environment interpolator, which holds whichever
+# dimension the player is standing in. The portal render swaps in one belonging to the dimension
+# it is looking into; it cannot share the player's, because each entry lerps between a previous
+# and a current value and alternating worlds through it makes both views flicker.
+accessible field net/minecraft/client/render/Camera environmentAttributeInterpolator Lnet/minecraft/world/attribute/EnvironmentAttributeInterpolator;
+mutable field net/minecraft/client/render/Camera environmentAttributeInterpolator Lnet/minecraft/world/attribute/EnvironmentAttributeInterpolator;
+accessible method net/minecraft/client/render/GameRenderer getSkyDarkness (F)F
