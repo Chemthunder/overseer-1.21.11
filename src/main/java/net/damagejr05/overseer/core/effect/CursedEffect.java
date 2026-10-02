@@ -1,5 +1,6 @@
 package net.damagejr05.overseer.core.effect;
 
+import net.acoyt.acornlib.api.effect.UnclearableEffect;
 import net.minecraft.entity.effect.StatusEffect;
 import net.minecraft.entity.effect.StatusEffectCategory;
 import net.minecraft.entity.effect.StatusEffectInstance;
@@ -11,7 +12,7 @@ import net.minecraft.util.Formatting;
 /**
  * @author Chemthunder
  */
-public class CursedEffect extends StatusEffect {
+public class CursedEffect extends StatusEffect implements UnclearableEffect {
     public CursedEffect() {
         super(StatusEffectCategory.NEUTRAL, 0xFF000000);
     }
