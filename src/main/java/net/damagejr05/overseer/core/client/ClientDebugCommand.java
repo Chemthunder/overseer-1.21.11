@@ -78,15 +78,15 @@ public class ClientDebugCommand {
     }
 
     /**
-     * Nested world rendering can hard-crash the process on some drivers, so it stays behind this
-     * switch rather than being on by default.
+     * The live view is on by default; this is the way to turn it off, and back on after it has
+     * turned itself off following repeated errors.
      */
     private static int setPortalView(boolean enabled) {
         PortalViewRenderer.setEnabled(enabled);
 
         MinecraftClient client = MinecraftClient.getInstance();
-        line(client, "Portal see-through " + (enabled ? "enabled - this may crash the client" : "disabled"),
-                enabled ? Formatting.RED : Formatting.GREEN);
+        line(client, "Portal see-through " + (enabled ? "enabled" : "disabled (procedural aperture)"),
+                enabled ? Formatting.GREEN : Formatting.YELLOW);
 
         return 1;
     }

@@ -47,6 +47,11 @@ public class PortalTransitionClient {
         return fresh;
     }
 
+    /** As {@link #consume()}, but leaves the flag armed for whoever consumes it. */
+    public static boolean isArmed() {
+        return armedAt != Long.MIN_VALUE && System.currentTimeMillis() - armedAt <= TIMEOUT_MS;
+    }
+
     public static void clear() {
         armedAt = Long.MIN_VALUE;
     }

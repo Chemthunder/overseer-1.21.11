@@ -1,6 +1,8 @@
 package net.damagejr05.overseer.core.client;
 
 import net.damagejr05.overseer.core.Overseer;
+import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
+import net.damagejr05.overseer.core.portal.PortalAnchor;
 import net.damagejr05.overseer.core.client.render.PortalViewRenderer;
 import net.damagejr05.overseer.core.index.ModDimensions;
 import net.fabricmc.api.EnvType;
@@ -8,20 +10,29 @@ import net.fabricmc.api.Environment;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.render.BufferBuilderStorage;
+import net.minecraft.client.render.CloudRenderer;
 import net.minecraft.client.render.command.OrderedRenderCommandQueueImpl;
 import net.minecraft.client.render.command.RenderDispatcher;
 import net.minecraft.client.render.WorldRenderer;
 import net.minecraft.client.render.state.WorldRenderState;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.Entity;
+import net.minecraft.network.packet.s2c.play.UnloadChunkS2CPacket;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
+import net.minecraft.util.profiler.Profilers;
 import net.minecraft.world.World;
 import net.minecraft.world.dimension.DimensionType;
 import net.minecraft.world.dimension.DimensionTypes;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -53,6 +64,37 @@ public class SecondaryWorldManager {
     );
 
     private static boolean swapped = false;
+
+    /**
+     * How long a secondary world may sit with no chunks before it is dropped, in ticks.
+     *
+     * <p>The server unloads the far side when the player walks away from a doorway or the doorway
+     * closes, which leaves an empty world still holding a renderer, a chunk builder and its
+     * buffers, ticking for the rest of the session. Long enough that walking in and out of range
+     * does not rebuild it every time.
+     */
+    private static final int EMPTY_TICKS_BEFORE_DISPOSAL = 200;
+
+    private static final Map<RegistryKey<World>, Integer> EMPTY_TICKS = new HashMap<>();
+
+    /** Framebuffer size the secondary renderers were last sized for. */
+    private static int sizedWidth = -1;
+    private static int sizedHeight = -1;
+
+    /** Set from the resource reload, acted on at the next tick. */
+    private static boolean resourcesReloaded = false;
+
+    /**
+     * Vanilla rebuilds its own world renderer after a resource reload and knows nothing about
+     * these. Left alone they keep meshes whose texture coordinates point into the old atlas, and
+     * the far side of every doorway turns to noise the first time a resource pack changes.
+     *
+     * <p>Deferred to the tick rather than done in the reloader: the rebuild has to see the new
+     * atlas, and this may be called before it has been stitched.
+     */
+    public static void onResourcesReloaded() {
+        resourcesReloaded = true;
+    }
 
     /**
      * The world for a dimension, creating it if this is the first time it has been needed.
@@ -215,6 +257,7 @@ public class SecondaryWorldManager {
 
             renderer.setWorld(world);
             renderer.reload(client.getResourceManager());
+            loadClouds(client, renderer);
 
             // Vanilla only ever calls this from the window resize path, so a renderer created
             // mid-session would otherwise keep an unsized entity-outline framebuffer.
@@ -225,6 +268,11 @@ public class SecondaryWorldManager {
 
             WORLDS.put(dimension, world);
             RENDERERS.put(dimension, renderer);
+
+            // The clock starts at zero and the server's first sync is up to a second away. The
+            // player's own world is a far better guess than tick zero in the meantime: every
+            // dimension shares one day counter, so this is normally exactly right already.
+            world.setTime(primary.getTime(), primary.getTimeOfDay(), true);
 
             Overseer.LOGGER.info("Created secondary client world {}", dimension.getValue());
             return world;
@@ -311,6 +359,9 @@ public class SecondaryWorldManager {
             }
         }
 
+        maintainRenderers(client);
+        disposeEmptyWorlds();
+
         for (ClientWorld world : WORLDS.values()) {
             if (world == client.world) {
                 continue;
@@ -327,6 +378,309 @@ public class SecondaryWorldManager {
         }
     }
 
+    /** Keep the secondary renderers in step with things vanilla only tells its own renderer. */
+    private static void maintainRenderers(MinecraftClient client) {
+        if (resourcesReloaded) {
+            resourcesReloaded = false;
+
+            // Every renderer built here, wherever it currently is. One of them may be standing
+            // in as the client's main renderer, and vanilla reloads only the one it built.
+            List<WorldRenderer> ours = new ArrayList<>(RENDERERS.values());
+            ours.add(client.worldRenderer);
+
+            for (WorldRenderer renderer : ours) {
+                if (renderer == vanillaRenderer) {
+                    continue;
+                }
+
+                try {
+                    renderer.reload(client.getResourceManager());
+                    loadClouds(client, renderer);
+                    renderer.reload();
+                } catch (Throwable e) {
+                    Overseer.LOGGER.error("Failed to reload a secondary world renderer", e);
+                }
+            }
+        }
+
+        trimAdoptedWorld(client);
+
+        // Vanilla resizes its renderer from the window callback. A stale size here leaves the
+        // entity-outline target at the old resolution, and the glowing-entity pass then blits
+        // between two framebuffers that no longer match.
+        int width = client.getFramebuffer().textureWidth;
+        int height = client.getFramebuffer().textureHeight;
+
+        if (width != sizedWidth || height != sizedHeight) {
+            sizedWidth = width;
+            sizedHeight = height;
+
+            for (WorldRenderer renderer : RENDERERS.values()) {
+                renderer.onResized(width, height);
+            }
+        }
+    }
+
+    private static void loadClouds(MinecraftClient client, WorldRenderer renderer) {
+        CloudRenderer clouds = renderer.getCloudRenderer();
+        clouds.apply(clouds.prepare(client.getResourceManager(), Profilers.get()), client.getResourceManager(), Profilers.get());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Stepping through
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * The renderer and render state vanilla created at startup.
+     *
+     * <p>Remembered because they are special: vanilla registered that renderer as a resource
+     * reloader, so it must never be closed, and on disconnect it is put back where vanilla left
+     * it so that a session always starts from the state vanilla expects.
+     */
+    private static @Nullable WorldRenderer vanillaRenderer = null;
+    private static @Nullable WorldRenderState vanillaState = null;
+
+    /** The dispatcher belonging to the client's current main renderer, if that is one of ours. */
+    private static @Nullable RenderDispatcher primaryDispatcher = null;
+
+    /** The world being handed to vanilla, for the duration of the respawn packet that takes it. */
+    private static @Nullable ClientWorld adopting = null;
+
+    /** The dimension just left, whose leftovers still need clearing out. */
+    private static @Nullable RegistryKey<World> departed = null;
+
+    /** Chunks of the dimension just left that lie beyond anything a doorway will show. */
+    private static final ArrayDeque<ChunkPos> TRIM = new ArrayDeque<>();
+    private static @Nullable RegistryKey<World> trimDimension = null;
+
+    /** Spread over ticks: a whole view distance of unloads in one frame is a visible hitch. */
+    private static final int TRIM_PER_TICK = 48;
+
+    /** Matches the radius the server streams, with a ring to spare. */
+    private static final int KEEP_RADIUS = 5;
+
+    /**
+     * Hand the far world over to vanilla as the world the player is now in.
+     *
+     * <p>Without this, stepping through a doorway is a vanilla dimension change: the client throws
+     * its world away, builds an empty one, and waits for the server to send terrain and for that
+     * terrain to be meshed. For that long the player stands in nothing -- and all of it is
+     * terrain the client was holding, fully built, a moment earlier, because it was drawing it
+     * through the doorway.
+     *
+     * <p>So the two worlds trade places instead. The secondary world and its renderer become the
+     * client's own, meshes and all, and the world just left becomes the secondary for the
+     * doorway behind the player, so looking back shows it at once as well. Vanilla then carries
+     * on exactly as usual: the server's chunks arrive and replace what is there with identical
+     * data, one at a time, with nothing ever missing in between.
+     *
+     * @return the world to use in place of a new one, or null to let vanilla build its own
+     */
+    public static @Nullable ClientWorld adopt(RegistryKey<World> dimension, int loadDistance, int simulationDistance) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientWorld outgoing = client.world;
+
+        // Only for a crossing. A respawn, a nether portal or a /tp is not arriving next to
+        // anything that was on screen, and a stale secondary world is no substitute for a new one.
+        if (outgoing == null || !PortalTransitionClient.isArmed()) {
+            return null;
+        }
+
+        ClientWorld incoming = WORLDS.get(dimension);
+        WorldRenderer incomingRenderer = RENDERERS.get(dimension);
+        WorldRenderState incomingState = RENDER_STATES.get(dimension);
+        RegistryKey<World> outgoingDimension = outgoing.getRegistryKey();
+
+        if (incoming == null || incomingRenderer == null || incomingState == null
+                || incoming == outgoing || WORLDS.containsKey(outgoingDimension) || !hasTerrain(dimension)) {
+            return null;
+        }
+
+        if (vanillaRenderer == null) {
+            vanillaRenderer = client.worldRenderer;
+            vanillaState = client.gameRenderer.worldRenderState;
+        }
+
+        // The world just left takes the incoming one's place as a secondary...
+        WORLDS.remove(dimension);
+        RENDERERS.remove(dimension);
+        RENDER_STATES.remove(dimension);
+        RenderDispatcher incomingDispatcher = DISPATCHERS.remove(dimension);
+        EMPTY_TICKS.remove(dimension);
+        PacketRedirectionClient.forget(dimension);
+        PortalViewRenderer.forget(dimension);
+
+        WORLDS.put(outgoingDimension, outgoing);
+        RENDERERS.put(outgoingDimension, client.worldRenderer);
+        RENDER_STATES.put(outgoingDimension, client.gameRenderer.worldRenderState);
+        if (primaryDispatcher != null) {
+            DISPATCHERS.put(outgoingDimension, primaryDispatcher);
+        }
+
+        // ...and the incoming one becomes the client's own.
+        primaryDispatcher = incomingDispatcher;
+        client.worldRenderer = incomingRenderer;
+        client.gameRenderer.worldRenderState = incomingState;
+
+        // It was sized to hold a doorway's surroundings. It now has to hold a view distance.
+        incoming.getChunkManager().updateLoadDistance(loadDistance);
+        incoming.setSimulationDistance(simulationDistance);
+
+        DoorwayComponent.KEY.get(incoming).copyFrom(DoorwayComponent.KEY.get(outgoing));
+
+        adopting = incoming;
+        departed = outgoingDimension;
+
+        Overseer.LOGGER.info("Stepped through into {} without reloading it", dimension.getValue());
+        return incoming;
+    }
+
+    /**
+     * True while {@code world} is being handed over. Its renderer already holds it, fully meshed,
+     * and must not be told to start again from nothing.
+     */
+    public static boolean isAdopting(@Nullable ClientWorld world) {
+        return world != null && world == adopting;
+    }
+
+    /** Runs once vanilla has finished with the respawn packet, whether or not a world was adopted. */
+    public static void finishAdoption() {
+        adopting = null;
+
+        RegistryKey<World> dimension = departed;
+        departed = null;
+
+        ClientWorld world = dimension == null ? null : WORLDS.get(dimension);
+        if (world == null) {
+            return;
+        }
+
+        MinecraftClient client = MinecraftClient.getInstance();
+
+        // Everything that was in the world just left, the player's own previous body included --
+        // which would otherwise stand in the doorway behind them for ever. Vanilla simply drops
+        // the whole world at this point; this one is being kept, so it is emptied instead, and the
+        // server streams back whatever is still near the doorway within a tick.
+        List<Integer> ids = new ArrayList<>();
+        for (Entity entity : world.getEntities()) {
+            ids.add(entity.getId());
+        }
+
+        withWorld(world, () -> {
+            for (int id : ids) {
+                world.removeEntity(id, Entity.RemovalReason.DISCARDED);
+            }
+        });
+
+        // And everything out of sight of a doorway. The server only keeps the area around the
+        // doorway current from here on, so the rest would be a snapshot going stale -- and would
+        // keep this world from ever counting as empty and being dropped.
+        List<PortalAnchor> anchors = DoorwayComponent.KEY.get(world).anchorsIn(dimension);
+        ChunkPos centre = client.player == null
+                ? new ChunkPos(0, 0)
+                : new ChunkPos(BlockPos.ofFloored(client.gameRenderer.getCamera().getCameraPos()));
+        int reach = client.options.getClampedViewDistance() + 3;
+
+        TRIM.clear();
+        trimDimension = dimension;
+
+        // The camera has not moved yet -- the new position arrives with the next packet -- so it
+        // still marks the middle of what the departed world has loaded.
+        for (int x = -reach; x <= reach; x++) {
+            for (int z = -reach; z <= reach; z++) {
+                ChunkPos pos = new ChunkPos(centre.x + x, centre.z + z);
+
+                if (world.getChunkManager().getWorldChunk(pos.x, pos.z) != null && !nearAnchor(pos, anchors)) {
+                    TRIM.add(pos);
+                }
+            }
+        }
+    }
+
+    private static boolean nearAnchor(ChunkPos pos, List<PortalAnchor> anchors) {
+        for (PortalAnchor anchor : anchors) {
+            ChunkPos at = new ChunkPos(BlockPos.ofFloored(anchor.center()));
+
+            if (Math.abs(pos.x - at.x) <= KEEP_RADIUS && Math.abs(pos.z - at.z) <= KEEP_RADIUS) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void trimAdoptedWorld(MinecraftClient client) {
+        if (TRIM.isEmpty() || trimDimension == null) {
+            return;
+        }
+
+        ClientWorld world = WORLDS.get(trimDimension);
+        if (world == null || client.getNetworkHandler() == null) {
+            TRIM.clear();
+            return;
+        }
+
+        // Through the vanilla handler, so lighting and the renderer are told exactly as they
+        // would be for an unload the server had sent.
+        withWorld(world, () -> {
+            for (int i = 0; i < TRIM_PER_TICK && !TRIM.isEmpty(); i++) {
+                try {
+                    client.getNetworkHandler().onUnloadChunk(new UnloadChunkS2CPacket(TRIM.poll()));
+                } catch (Throwable e) {
+                    Overseer.LOGGER.error("Failed to trim a chunk from the world just left", e);
+                    TRIM.clear();
+                }
+            }
+        });
+    }
+
+    private static void disposeEmptyWorlds() {
+        List<RegistryKey<World>> expired = null;
+
+        for (Map.Entry<RegistryKey<World>, ClientWorld> entry : WORLDS.entrySet()) {
+            if (entry.getValue().getChunkManager().getLoadedChunkCount() > 0) {
+                EMPTY_TICKS.remove(entry.getKey());
+                continue;
+            }
+
+            if (EMPTY_TICKS.merge(entry.getKey(), 1, Integer::sum) >= EMPTY_TICKS_BEFORE_DISPOSAL) {
+                if (expired == null) {
+                    expired = new ArrayList<>(1);
+                }
+                expired.add(entry.getKey());
+            }
+        }
+
+        if (expired == null) {
+            return;
+        }
+
+        for (RegistryKey<World> dimension : expired) {
+            dispose(dimension);
+            Overseer.LOGGER.info("Dropped idle secondary world {}", dimension.getValue());
+        }
+    }
+
+    /** Whether a dimension has terrain to show. An empty world renders as bare sky. */
+    public static boolean hasTerrain(RegistryKey<World> dimension) {
+        ClientWorld world = WORLDS.get(dimension);
+        return world != null && world.getChunkManager().getLoadedChunkCount() > 0;
+    }
+
+    /**
+     * Whether the terrain around one spot of a dimension is loaded. A dimension can hold the far
+     * side of one doorway and not of another standing right beside it.
+     */
+    public static boolean hasTerrainAt(RegistryKey<World> dimension, net.minecraft.util.math.Vec3d pos) {
+        ClientWorld world = WORLDS.get(dimension);
+        if (world == null) {
+            return false;
+        }
+
+        ChunkPos chunk = new ChunkPos(BlockPos.ofFloored(pos));
+        return world.getChunkManager().isChunkLoaded(chunk.x, chunk.z);
+    }
+
     /** Tear down one secondary world and everything allocated alongside it. */
     private static void dispose(RegistryKey<World> dimension) {
         MinecraftClient client = MinecraftClient.getInstance();
@@ -338,11 +692,22 @@ public class SecondaryWorldManager {
         WorldRenderer renderer = RENDERERS.remove(dimension);
         if (renderer != null && renderer != client.worldRenderer) {
             renderer.setWorld(null);
-            renderer.close();
+
+            // Vanilla's own renderer is only ever set aside, never closed: it is registered as a
+            // resource reloader and goes back into service on disconnect.
+            if (renderer != vanillaRenderer) {
+                renderer.close();
+            }
         }
 
         RENDER_STATES.remove(dimension);
+        EMPTY_TICKS.remove(dimension);
         PortalViewRenderer.forget(dimension);
+
+        if (dimension == trimDimension) {
+            TRIM.clear();
+            trimDimension = null;
+        }
 
         RenderDispatcher dispatcher = DISPATCHERS.remove(dimension);
         if (dispatcher != null) {
@@ -362,7 +727,10 @@ public class SecondaryWorldManager {
         for (WorldRenderer renderer : RENDERERS.values()) {
             if (renderer != client.worldRenderer) {
                 renderer.setWorld(null);
-                renderer.close();
+
+                if (renderer != vanillaRenderer) {
+                    renderer.close();
+                }
             }
         }
 
@@ -370,12 +738,36 @@ public class SecondaryWorldManager {
             dispatcher.close();
         }
 
+        // If one of ours is standing in as the main renderer, put vanilla's back. The next
+        // session then starts from exactly the objects vanilla created, whatever happened in
+        // this one.
+        if (vanillaRenderer != null && client.worldRenderer != vanillaRenderer) {
+            WorldRenderer standIn = client.worldRenderer;
+
+            client.worldRenderer = vanillaRenderer;
+            client.gameRenderer.worldRenderState = vanillaState;
+
+            standIn.setWorld(null);
+            standIn.close();
+
+            if (primaryDispatcher != null) {
+                primaryDispatcher.close();
+            }
+        }
+
+        primaryDispatcher = null;
+        adopting = null;
+        departed = null;
+        TRIM.clear();
+        trimDimension = null;
+
         PacketRedirectionClient.clear();
 
         WORLDS.clear();
         RENDERERS.clear();
         DISPATCHERS.clear();
         RENDER_STATES.clear();
+        EMPTY_TICKS.clear();
         swapped = false;
         lastDimension = null;
     }

@@ -13,7 +13,9 @@ import net.damagejr05.overseer.core.cca.entity.OverseerComponent;
 import net.damagejr05.overseer.core.cca.entity.VictimComponent;
 import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
 import net.damagejr05.overseer.core.index.ModDimensions;
+import net.damagejr05.overseer.core.portal.Eviction;
 import net.damagejr05.overseer.core.portal.PortalAnchor;
+import net.damagejr05.overseer.core.portal.PortalPair;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.command.CommandRegistryAccess;
@@ -48,6 +50,10 @@ public class OverseerCommand implements CommandRegistrationCallback {
         BlockPos pos = BlockPosArgumentType.getBlockPos(context, "pos");
         Direction facing = cardinal(context);
 
+        if (context.getSource().getWorld().getRegistryKey() == ModDimensions.MEMORY) {
+            return openDynamicFromMemory(context, pos, facing, seconds);
+        }
+
         // Same convention as the permanent doorway: base on the block's floor, so the opening
         // stands on the ground rather than sinking a block into it.
         PortalAnchor outer = PortalAnchor.of(
@@ -71,6 +77,39 @@ public class OverseerCommand implements CommandRegistrationCallback {
     }
 
     /**
+     * Opened from inside the memory dimension, the doorway stands where it was asked for and its
+     * other end is worked out instead: the matching spot in the overworld, on the surface.
+     */
+    private static int openDynamicFromMemory(CommandContext<ServerCommandSource> context, BlockPos pos,
+                                             Direction facing, int seconds) throws CommandSyntaxException {
+        PortalAnchor inner = PortalAnchor.of(
+                ModDimensions.MEMORY,
+                blockFloor(pos).add(0, PortalAnchor.DEFAULT_HEIGHT / 2.0, 0),
+                facing
+        );
+
+        // Two doorways in the same spot cannot be told apart by whoever walks into them.
+        if (inner.center().distanceTo(ModDimensions.fixedMemoryAnchor().center()) < ModDimensions.MINIMUM_SEPARATION) {
+            throw TOO_CLOSE.create();
+        }
+
+        ServerWorld overworld = context.getSource().getServer().getOverworld();
+        PortalAnchor outer = ModDimensions.overworldAnchorFor(overworld, inner);
+
+        DoorwayComponent.get(context.getSource().getServer()).openDynamic(new PortalPair(outer, inner), seconds * 20);
+
+        context.getSource().sendFeedback(
+                () -> Text.literal(String.format(
+                        "Doorway opened at %s facing %s for %ds, leading out to the overworld at %.1f %.1f %.1f",
+                        pos.toShortString(), facing.asString(), seconds,
+                        outer.center().x, outer.center().y - PortalAnchor.DEFAULT_HEIGHT / 2.0, outer.center().z
+                )),
+                true
+        );
+        return 1;
+    }
+
+    /**
      * Places the permanent doorway's overworld end. Its memory end is derived, never given.
      */
     /** Centre of a block in X/Z, its floor in Y — where a player standing there would be. */
@@ -78,7 +117,13 @@ public class OverseerCommand implements CommandRegistrationCallback {
         return new Vec3d(pos.getX() + 0.5, pos.getY(), pos.getZ() + 0.5);
     }
 
-    private static int placeFixed(CommandContext<ServerCommandSource> context, Vec3d centre, Direction facing) {
+    private static int placeFixed(CommandContext<ServerCommandSource> context, Vec3d centre, Direction facing) throws CommandSyntaxException {
+        // Its memory end is always the origin, so placing it from in here would link the memory
+        // dimension to itself.
+        if (context.getSource().getWorld().getRegistryKey() == ModDimensions.MEMORY) {
+            throw FIXED_IN_MEMORY.create();
+        }
+
         // Raise it so its base sits at the given position rather than its middle.
         Vec3d anchorCentre = centre.add(0, PortalAnchor.DEFAULT_HEIGHT / 2.0, 0);
 
@@ -104,6 +149,23 @@ public class OverseerCommand implements CommandRegistrationCallback {
 
     private static final SimpleCommandExceptionType NOT_CARDINAL =
             new SimpleCommandExceptionType(Text.literal("Facing must be north, south, east or west"));
+
+    private static final SimpleCommandExceptionType ALREADY_EVICTING =
+            new SimpleCommandExceptionType(Text.literal("The eye is already open"));
+
+    private static int setAccess(CommandContext<ServerCommandSource> context, boolean admitting) {
+        DoorwayComponent.get(context.getSource().getServer()).setAdmitting(admitting);
+        context.getSource().sendFeedback(() -> Text.literal(
+                admitting ? "Doorways opened to everyone." : "Doorways sealed to everyone but the Overseer."
+        ), true);
+        return 1;
+    }
+
+    private static final SimpleCommandExceptionType TOO_CLOSE =
+            new SimpleCommandExceptionType(Text.literal("Too close to the permanent doorway - open it a few blocks further away"));
+
+    private static final SimpleCommandExceptionType FIXED_IN_MEMORY =
+            new SimpleCommandExceptionType(Text.literal("The permanent doorway is placed from outside the memory dimension. Use /overseer doorway create for a way out"));
 
     private static final SimpleCommandExceptionType NO_MEMORY_DIMENSION =
             new SimpleCommandExceptionType(Text.literal("The memory dimension is not loaded"));
@@ -166,7 +228,36 @@ public class OverseerCommand implements CommandRegistrationCallback {
                     return 1;
                 }))))
 
+                .then(literal("evict").executes(context -> {
+                    if (!Eviction.start(context.getSource().getServer(), ModDimensions.fixedMemoryAnchor().center())) {
+                        throw ALREADY_EVICTING.create();
+                    }
+
+                    context.getSource().sendFeedback(() -> Text.literal("The eye opens."), true);
+                    return 1;
+                }))
+
+                // Let guests through the doorways, or not. With no argument it flips the setting.
+                .then(literal("guests")
+                        .executes(context -> setAccess(
+                                context, !DoorwayComponent.get(context.getSource().getServer()).isAdmitting()
+                        ))
+                        .then(argument("allowed", BoolArgumentType.bool()).executes(context -> setAccess(
+                                context, BoolArgumentType.getBool(context, "allowed")
+                        ))))
+
                 .then(literal("doorway")
+                        // Whether anyone but the Overseer may walk through.
+                        .then(literal("access")
+                                .executes(context -> {
+                                    boolean admitting = DoorwayComponent.get(context.getSource().getServer()).isAdmitting();
+                                    context.getSource().sendFeedback(() -> Text.literal(
+                                            admitting ? "Doorways are open to everyone." : "Doorways are sealed to everyone but the Overseer."
+                                    ), false);
+                                    return 1;
+                                })
+                                .then(literal("open").executes(context -> setAccess(context, true)))
+                                .then(literal("sealed").executes(context -> setAccess(context, false))))
                         .then(literal("fixed")
                                 // No arguments: at your feet, facing the way you are looking.
                                 .executes(context -> {

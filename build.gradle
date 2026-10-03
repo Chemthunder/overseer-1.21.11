@@ -8,6 +8,18 @@ group = project.maven_group
 
 loom {
     accessWidenerPath = file("src/main/resources/overseer.accesswidener")
+
+    runs {
+        configureEach {
+            // HotSpot's C2 compiler can crash the whole JVM in its ReduceAllocationMerges
+            // optimisation (JDK 22 and later, on by default). It took the dev client down mid
+            // session while compiling the per-frame portal render. The code that triggered it has
+            // been rewritten to avoid the pattern, but the optimisation can fire on any method,
+            // so it is also switched off for dev runs. The first flag keeps this harmless on a
+            // JDK too old to know the option; the second is needed because it is a diagnostic one.
+            vmArgs "-XX:+IgnoreUnrecognizedVMOptions", "-XX:+UnlockDiagnosticVMOptions", "-XX:-ReduceAllocationMerges"
+        }
+    }
 }
 
 repositories {

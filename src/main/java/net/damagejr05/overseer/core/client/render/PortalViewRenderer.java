@@ -7,6 +7,7 @@ import de.nexusrealms.nebulon.api.render.client.ManagedRenderTarget;
 import de.nexusrealms.nebulon.api.render.client.NebulonRenderTargets;
 import de.nexusrealms.nebulon.api.render.client.RenderTargetDescriptor;
 import net.damagejr05.overseer.core.Overseer;
+import net.damagejr05.overseer.core.OverseerClient;
 import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
 import net.damagejr05.overseer.core.client.SecondaryWorldManager;
 import net.damagejr05.overseer.core.portal.PortalAnchor;
@@ -23,6 +24,7 @@ import net.minecraft.client.gl.Framebuffer;
 import net.minecraft.client.gl.GlobalSettings;
 import net.minecraft.client.option.TextureFilteringMode;
 import net.minecraft.client.render.Camera;
+import net.minecraft.client.render.LightmapTextureManager;
 import net.minecraft.client.render.RawProjectionMatrix;
 import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.render.WorldRenderer;
@@ -32,6 +34,8 @@ import net.minecraft.client.render.state.CameraRenderState;
 import net.minecraft.client.render.state.WorldRenderState;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.registry.RegistryKey;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
 import net.minecraft.world.World;
 import net.minecraft.world.attribute.EnvironmentAttributeInterpolator;
 import net.minecraft.util.math.BlockPos;
@@ -62,15 +66,22 @@ public class PortalViewRenderer {
     private static @Nullable ManagedRenderTarget target;
 
     /**
-     * Nested world rendering is off by default.
+     * Nested world rendering is on by default.
      *
-     * <p>A nested world render touches a lot of shared GPU state, and when it goes wrong the
-     * process dies outright rather than throwing, so this stays opt-in until it has been proven on
-     * real hardware. With it off the portal falls back to the procedural aperture in the shader.
+     * <p>With it off the portal falls back to the procedural aperture in the shader. It can be
+     * switched off in game with {@code /overseerclient portalview off}, and it switches itself
+     * off after {@link #MAX_CONSECUTIVE_FAILURES} failed frames in a row rather than failing
+     * sixty times a second for the rest of the session.
      *
-     * <p>Toggle in game with {@code /overseerclient portalview on}.
+     * <p>Neither of those helps if a driver takes the process down on the very first frame, since
+     * there is then no session to type a command into. Launching with
+     * {@code -Doverseer.portalView=false} starts with it off.
      */
-    private static boolean enabled = false;
+    private static boolean enabled = Boolean.parseBoolean(System.getProperty("overseer.portalView", "true"));
+
+    private static final int MAX_CONSECUTIVE_FAILURES = 3;
+
+    private static int consecutiveFailures = 0;
 
     /** True when this frame produced a usable portal view texture. */
     private static boolean valid = false;
@@ -83,6 +94,103 @@ public class PortalViewRenderer {
      * A doorway is a physical object, so it should not vanish when walked around.
      */
     private static final List<PortalAnchor> visible = new ArrayList<>();
+
+    /**
+     * True when a doorway was in range this frame but skipped only for being off screen.
+     *
+     * <p>The compositor fades the live view in over the procedural one. A doorway that has merely
+     * left the screen has not lost its view in any sense the player can see, and without this the
+     * fade would run out while their back was turned and replay every time they looked round.
+     */
+    private static boolean culledOffScreen = false;
+
+    public static boolean culledOffScreen() {
+        return culledOffScreen;
+    }
+
+    /**
+     * The doorway the camera has passed through but the server has not yet moved the player for.
+     *
+     * <p>The crossing is decided on the server, once a tick, and the answer then has to travel
+     * back. For those few frames the camera is already beyond the opening: the surface it was
+     * looking into is behind it, and what is in front is whatever stands behind the doorway in
+     * the world it is about to leave -- usually the inside of a wall. That is a flash of the wrong
+     * place in the middle of every crossing.
+     *
+     * <p>While this is set, the far side is rendered without the portal-plane clip, which would
+     * now cut away everything in front of the camera, and the compositor fills the whole screen
+     * with it. The picture is then the same one the player gets a moment later when the
+     * dimension change lands, so the handover has nothing to show.
+     */
+    private static @Nullable PortalAnchor through = null;
+    private static boolean throughFromFront = false;
+    private static long throughSince = 0L;
+
+    /** How long to hold the full-screen view waiting for the server, in milliseconds. */
+    private static final long THROUGH_TIMEOUT_MS = 750L;
+
+    /** Signed distance of the camera from each doorway last frame, to see it change sign. */
+    private static final Map<PortalAnchor, Double> LAST_DISTANCE = new HashMap<>();
+    private static @Nullable Vec3d lastCameraPos = null;
+    private static @Nullable ClientWorld lastWorld = null;
+
+    /** True when this frame's view should cover the screen rather than fill an aperture. */
+    public static boolean isThrough() {
+        return through != null && valid && through.equals(renderedEntry);
+    }
+
+    private static void trackCrossing(MinecraftClient client, ClientWorld world, Vec3d cameraPos) {
+        // A new world means the crossing happened. Nothing measured in the old one carries over.
+        if (world != lastWorld) {
+            lastWorld = world;
+            lastCameraPos = null;
+            through = null;
+            LAST_DISTANCE.clear();
+        }
+
+        // Only someone the server will actually move, and only in first person: in third person
+        // the camera trails the body and crosses the plane at a different moment from it.
+        boolean willCross = client.options.getPerspective().isFirstPerson()
+                && client.player != null
+                && DoorwayComponent.get(world).mayEnter(client.player);
+
+        LAST_DISTANCE.keySet().retainAll(visible);
+
+        for (PortalAnchor anchor : visible) {
+            double distance = anchor.signedDistance(cameraPos);
+            Double before = LAST_DISTANCE.put(anchor, distance);
+
+            if (before == null || lastCameraPos == null || through != null || !willCross) {
+                continue;
+            }
+
+            if ((before > 0.0) == (distance > 0.0) || before == distance) {
+                continue;
+            }
+
+            // Through the opening, not round the side of it.
+            Vec3d hit = lastCameraPos.lerp(cameraPos, before / (before - distance));
+            if (anchor.withinOpening(hit) && lastCameraPos.squaredDistanceTo(cameraPos) < 16.0) {
+                through = anchor;
+                throughFromFront = before > 0.0;
+                throughSince = System.currentTimeMillis();
+            }
+        }
+
+        if (through != null) {
+            double distance = through.signedDistance(cameraPos);
+
+            // Stepped back out, wandered off, or the server never agreed there was a crossing.
+            if (!visible.contains(through)
+                    || (distance > 0.0) == throughFromFront
+                    || Math.abs(distance) > 2.0
+                    || System.currentTimeMillis() - throughSince > THROUGH_TIMEOUT_MS) {
+                through = null;
+            }
+        }
+
+        lastCameraPos = cameraPos;
+    }
 
     /** Guards against recursion: a portal seen through a portal renders flat. */
     private static boolean rendering = false;
@@ -126,6 +234,27 @@ public class PortalViewRenderer {
     private static @Nullable FogRenderer fog;
 
     /**
+     * The portal render's own lightmap.
+     *
+     * <p>Every lit surface takes its brightness from one 16x16 texture owned by the game renderer,
+     * built once a frame from the dimension the player is standing in: its ambient light, its sky
+     * light factor, its sky colour. Rendering another dimension against that texture lights it as
+     * though it were this one. Seen from the memory dimension, which has no skylight at all, the
+     * overworld came out dim and flat at noon and midnight alike.
+     *
+     * <p>A second instance rather than rebuilding the shared one twice a frame, for the same
+     * reason the fog has its own: the main render's copy is left completely alone.
+     */
+    private static @Nullable LightmapTextureManager lightmap;
+
+    /** The client tick and dimension {@link #lightmap} was last rebuilt for. */
+    private static int lightmapAge = -1;
+    private static @Nullable RegistryKey<World> lightmapDimension = null;
+
+    /** The client tick each dimension's environment was last advanced on. */
+    private static final Map<RegistryKey<World>, Integer> ENVIRONMENT_AGES = new HashMap<>();
+
+    /**
      * A separate environment interpolator per remote dimension.
      *
      * <p>Sky, fog and cloud colour are all read from {@code Camera}'s interpolator, which holds the
@@ -140,6 +269,7 @@ public class PortalViewRenderer {
     /** Drop cached per-dimension state when a secondary world goes away. */
     public static void forget(RegistryKey<World> dimension) {
         ENVIRONMENTS.remove(dimension);
+        ENVIRONMENT_AGES.remove(dimension);
     }
 
     public static boolean isEnabled() {
@@ -148,6 +278,7 @@ public class PortalViewRenderer {
 
     public static void setEnabled(boolean value) {
         enabled = value;
+        consecutiveFailures = 0;
     }
 
     /** Draws the aperture as flat magenta so its real shape and position can be seen. */
@@ -197,6 +328,17 @@ public class PortalViewRenderer {
         return scenePositionMatrix;
     }
 
+    /** The virtual camera's view rotation, while the nested render is running. */
+    private static @Nullable Matrix4f nestedPositionMatrix = null;
+
+    /**
+     * The view rotation of whichever render is in progress: the portal's while its nested render
+     * runs, the scene's otherwise. For things that draw into both.
+     */
+    public static @Nullable Matrix4f activePositionMatrix() {
+        return rendering && nestedPositionMatrix != null ? nestedPositionMatrix : scenePositionMatrix;
+    }
+
     public static String describeLastRender() {
         if (lastExit == null || lastVirtualPos == null) {
             return "no portal view rendered";
@@ -234,6 +376,7 @@ public class PortalViewRenderer {
         scenePositionMatrix = framePositionMatrix;
         valid = false;
         renderedEntry = null;
+        culledOffScreen = false;
         visible.clear();
 
         if (rendering || target == null) {
@@ -252,16 +395,43 @@ public class PortalViewRenderer {
         // Everything in this dimension gets drawn, from any angle.
         visible.addAll(doorways.anchorsIn(world.getRegistryKey()));
 
-        // Only the one being looked into from its approach side gets a live view behind it.
-        PortalTransform transform = selectVisible(client, doorways);
-        if (transform == null || !enabled) {
+        if (!enabled) {
             return;
         }
 
-        ClientWorld farWorld = SecondaryWorldManager.getOrCreate(transform.to().dimension());
+        trackCrossing(client, world, client.gameRenderer.getCamera().getCameraPos());
+
+        // The doorway being walked through, if there is one; otherwise the nearest on screen.
+        PortalTransform transform = null;
+
+        if (through != null) {
+            for (var pair : doorways.pairs()) {
+                PortalTransform candidate = pair.from(world.getRegistryKey());
+                if (candidate != null && candidate.from().equals(through)) {
+                    transform = candidate;
+                }
+            }
+        }
+
+        boolean passingThrough = transform != null;
+
+        if (transform == null) {
+            transform = selectVisible(client, doorways, framePositionMatrix, frameBasicProjection);
+        }
+
+        if (transform == null) {
+            return;
+        }
+
+        // get, not getOrCreate. The server only streams the far side to players close to a
+        // doorway, and until it has there is nothing to show but bare sky -- the procedural
+        // aperture reads far better than that, and conjuring an empty world here would only have
+        // it dropped again as idle a few seconds later.
+        ClientWorld farWorld = SecondaryWorldManager.get(transform.to().dimension());
         WorldRenderer farRenderer = SecondaryWorldManager.renderer(transform.to().dimension());
 
-        if (farWorld == null || farRenderer == null) {
+        if (farWorld == null || farRenderer == null || farWorld == world
+                || !SecondaryWorldManager.hasTerrain(transform.to().dimension())) {
             return;
         }
 
@@ -271,24 +441,56 @@ public class PortalViewRenderer {
 
         rendering = true;
         try {
-            renderInto(client, tickCounter, transform, farWorld, farRenderer,
-                    frameBasicProjection, frameProjection, frameFog, frameFogColor);
-            valid = true;
-            renderedEntry = transform.from();
+            // False means it declined to draw this frame, which is not a failure -- but the target
+            // then still holds whatever was in it before, so it must not be sampled.
+            if (renderInto(client, tickCounter, transform, farWorld, farRenderer,
+                    frameBasicProjection, frameProjection, frameFog, frameFogColor, !passingThrough)) {
+                valid = true;
+                renderedEntry = transform.from();
+            }
+
+            consecutiveFailures = 0;
         } catch (Throwable e) {
             Overseer.LOGGER.error("Portal view render failed", e);
             valid = false;
+            onFailure(client);
         } finally {
             rendering = false;
         }
     }
 
     /**
-     * Pick the portal worth rendering: one in this dimension, in front of the camera, and close
-     * enough to matter. Only one is rendered per frame — a second full world render per portal is
-     * not worth the cost for a pair that is rarely both on screen.
+     * One bad frame is survivable and is simply skipped. The same failure every frame is not: it
+     * costs a full world render's worth of work and a stack trace in the log sixty times a
+     * second, so after a few in a row the live view is switched off and the player is told why
+     * their doorways have gone back to the procedural aperture.
      */
-    private static @Nullable PortalTransform selectVisible(MinecraftClient client, DoorwayComponent doorways) {
+    private static void onFailure(MinecraftClient client) {
+        if (++consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+            return;
+        }
+
+        enabled = false;
+        consecutiveFailures = 0;
+
+        Overseer.LOGGER.error("Portal see-through disabled after {} consecutive failed frames", MAX_CONSECUTIVE_FAILURES);
+
+        if (client.player != null) {
+            client.player.sendMessage(
+                    Text.literal("Portal see-through hit repeated errors and was turned off. "
+                            + "Re-enable with /overseerclient portalview on").formatted(Formatting.RED),
+                    false
+            );
+        }
+    }
+
+    /**
+     * Pick the portal worth rendering: one in this dimension, on screen, and close enough to
+     * matter. Only one is rendered per frame — a second full world render per portal is not worth
+     * the cost for a pair that is rarely both on screen.
+     */
+    private static @Nullable PortalTransform selectVisible(MinecraftClient client, DoorwayComponent doorways,
+                                                           Matrix4f view, Matrix4f projection) {
         Vec3d cameraPos = client.gameRenderer.getCamera().getCameraPos();
         var dimension = client.world == null ? null : client.world.getRegistryKey();
 
@@ -309,7 +511,36 @@ public class PortalViewRenderer {
             // its clip plane to match. A doorway you can only see through from one side reads as
             // a painted-on decal the moment you walk around it.
             double distance = cameraPos.squaredDistanceTo(entry.center());
-            if (distance < bestDistance && distance < 64 * 64) {
+
+            // The portal an eviction opens hangs far off in the sky and is the size of a house.
+            // It is also the one the server is streaming, so when it can be seen it is the one
+            // to look through, whatever else is nearer.
+            if (doorways.isEvictionAnchor(entry)) {
+                if (distance < 256 * 256
+                        && isOnScreen(entry, cameraPos, view, projection)
+                        && SecondaryWorldManager.hasTerrainAt(candidate.to().dimension(), candidate.to().center())) {
+                    return candidate;
+                }
+
+                continue;
+            }
+
+            if (distance >= 64 * 64) {
+                continue;
+            }
+
+            // The server streams the far side of one doorway at a time. A doorway whose far side
+            // is not here keeps its procedural aperture rather than showing a view of nothing.
+            if (!SecondaryWorldManager.hasTerrainAt(candidate.to().dimension(), candidate.to().center())) {
+                continue;
+            }
+
+            if (!isOnScreen(entry, cameraPos, view, projection)) {
+                culledOffScreen = true;
+                continue;
+            }
+
+            if (distance < bestDistance) {
                 bestDistance = distance;
                 best = candidate;
             }
@@ -318,14 +549,59 @@ public class PortalViewRenderer {
         return best;
     }
 
+    /**
+     * Whether any part of the opening can land on screen.
+     *
+     * <p>The live view costs a second full world render, and without this it was paid every frame
+     * for any doorway within range -- including one directly behind the player. Standing with
+     * your back to a doorway halved the frame rate for a picture nobody could see.
+     *
+     * <p>Deliberately conservative. The opening is only rejected when all four corners are off
+     * the same side of the screen, or all four are behind the camera; anything straddling the
+     * camera plane counts as visible, since a corner behind the camera has no meaningful screen
+     * position to test.
+     */
+    private static boolean isOnScreen(PortalAnchor entry, Vec3d cameraPos, Matrix4f view, Matrix4f projection) {
+        Matrix4f viewProjection = new Matrix4f(projection).mul(view);
+
+        Vec3d centre = entry.center().subtract(cameraPos);
+        Vec3d right = entry.right().multiply(entry.width() / 2.0);
+        double up = entry.height() / 2.0;
+
+        int behind = 0, left = 0, rightOf = 0, below = 0, above = 0;
+        Vector4f clip = new Vector4f();
+
+        for (int corner = 0; corner < 4; corner++) {
+            Vec3d point = centre
+                    .add(right.multiply((corner & 1) == 0 ? -1.0 : 1.0))
+                    .add(0, (corner & 2) == 0 ? -up : up, 0);
+
+            clip.set((float) point.x, (float) point.y, (float) point.z, 1.0F);
+            viewProjection.transform(clip);
+
+            if (!(clip.w > 0.0F)) {
+                behind++;
+                continue;
+            }
+
+            if (clip.x < -clip.w) left++;
+            if (clip.x > clip.w) rightOf++;
+            if (clip.y < -clip.w) below++;
+            if (clip.y > clip.w) above++;
+        }
+
+        return behind != 4 && left != 4 && rightOf != 4 && below != 4 && above != 4;
+    }
+
     private static boolean isFinite(Vec3d v) {
         return Double.isFinite(v.x) && Double.isFinite(v.y) && Double.isFinite(v.z);
     }
 
-    private static void renderInto(MinecraftClient client, RenderTickCounter tickCounter,
+    /** @return whether the offscreen target now holds this frame's view */
+    private static boolean renderInto(MinecraftClient client, RenderTickCounter tickCounter,
                                    PortalTransform transform, ClientWorld farWorld, WorldRenderer farRenderer,
                                    Matrix4f frameBasicProjection, Matrix4f frameProjection,
-                                   GpuBufferSlice frameFog, Vector4f frameFogColor) {
+                                   GpuBufferSlice frameFog, Vector4f frameFogColor, boolean clipToPortal) {
         Camera realCamera = client.gameRenderer.getCamera();
         Vec3d realPos = realCamera.getCameraPos();
 
@@ -341,7 +617,7 @@ public class PortalViewRenderer {
         // then never terminates -- the client hangs rather than throwing. Refuse to render.
         if (!isFinite(virtualPos) || !Float.isFinite(virtualYaw)) {
             Overseer.LOGGER.warn("Skipping portal view: virtual camera is not finite ({} yaw {})", virtualPos, virtualYaw);
-            return;
+            return false;
         }
 
         Framebuffer main = client.getFramebuffer();
@@ -370,6 +646,9 @@ public class PortalViewRenderer {
         Framebuffer previousFramebuffer = client.framebuffer;
         GpuBufferSlice previousProjection = RenderSystem.getProjectionMatrixBuffer();
         ProjectionType previousProjectionType = RenderSystem.getProjectionType();
+        LightmapTextureManager previousLightmap = client.gameRenderer.lightmapTextureManager;
+        RegistryKey<World> farDimension = transform.to().dimension();
+        int age = OverseerClient.age;
 
         try {
             virtualCamera.setPos(virtualPos);
@@ -381,7 +660,15 @@ public class PortalViewRenderer {
                     ENVIRONMENTS.computeIfAbsent(transform.to().dimension(), key -> new EnvironmentAttributeInterpolator());
 
             virtualCamera.environmentAttributeInterpolator = farEnvironment;
-            farEnvironment.update(farWorld, virtualPos);
+
+            // Once per tick, as vanilla does for the camera's own. Every value in here is lerped
+            // from where it was at the last update to where it is now by tick progress; updating
+            // every frame collapses that to a step, and a sunset through the doorway advanced in
+            // twenty jumps a second while the one overhead moved smoothly.
+            Integer environmentAge = ENVIRONMENT_AGES.put(farDimension, age);
+            if (environmentAge == null || environmentAge != age) {
+                farEnvironment.update(farWorld, virtualPos);
+            }
 
             // The frame's own matrices, straight from GameRenderer. Recomputing them here would drop
             // view bobbing and hurt tilt, and the composite would sample a view that no longer lines up
@@ -397,6 +684,7 @@ public class PortalViewRenderer {
             Matrix4f positionMatrix = new Matrix4f().rotation(
                     virtualCamera.getRotation().conjugate(new Quaternionf())
             );
+            nestedPositionMatrix = positionMatrix;
 
             // Clip the BOBBED projection. GameRenderer bakes view bob, hurt tilt and nausea into
             // basicProjectionMatrix and uploads that as the rasterisation ProjMat; the third matrix
@@ -404,7 +692,13 @@ public class PortalViewRenderer {
             // WorldRenderer.render never reads basicProjectionMatrix at all. Clipping the clean one
             // and uploading it rendered the far side without bob while the near scene had it, so the
             // two drifted apart every time the player walked.
-            Matrix4f clipped = ObliqueProjection.apply(basicProjection, positionMatrix, virtualPos, transform.to());
+            //
+            // Except when the camera is already through. The virtual camera is then on the far
+            // side of the exit, looking away from it, and the clip would remove the whole view.
+            //
+            // One call either way, not a choice between two expressions that each make a matrix:
+            // see ObliqueProjection.apply for why that distinction crashes the JVM.
+            Matrix4f clipped = ObliqueProjection.apply(basicProjection, positionMatrix, virtualPos, transform.to(), clipToPortal);
 
             // The far world's own fog, from our own FogRenderer so the main render's slice survives.
             //
@@ -483,6 +777,25 @@ public class PortalViewRenderer {
                     // assignment and the call moves the camera, this is where it shows up.
                     lastRenderedCameraPos = client.gameRenderer.getCamera().getCameraPos();
 
+                    // Inside the swap, because the lightmap reads the dimension straight off
+                    // client.world and the sky light off the camera's environment -- both of which
+                    // are the far side's only in here.
+                    if (lightmap == null) {
+                        lightmap = new LightmapTextureManager(client.gameRenderer, client);
+                    }
+
+                    // tick() is what marks it dirty, and it also advances the torch flicker, so it
+                    // is called once per client tick exactly as vanilla calls its own -- plus once
+                    // when the view moves to another dimension, which cannot wait for the next tick.
+                    if (lightmapAge != age || lightmapDimension != farDimension) {
+                        lightmapAge = age;
+                        lightmapDimension = farDimension;
+                        lightmap.tick();
+                    }
+
+                    client.gameRenderer.lightmapTextureManager = lightmap;
+                    lightmap.update(1.0F);
+
                     farRenderer.render(
                         POOL,
                         tickCounter,
@@ -508,7 +821,11 @@ public class PortalViewRenderer {
                         true
                     );
                 });
+
+            return true;
         } finally {
+            nestedPositionMatrix = null;
+            client.gameRenderer.lightmapTextureManager = previousLightmap;
             virtualCamera.environmentAttributeInterpolator = realEnvironment;
             if (farState != null && previousCameraState != null) {
                 farState.cameraRenderState = previousCameraState;

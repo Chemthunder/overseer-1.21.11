@@ -4,6 +4,7 @@ import net.damagejr05.overseer.core.Overseer;
 import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
 import net.damagejr05.overseer.core.portal.PortalAnchor;
 import net.damagejr05.overseer.core.portal.PortalPair;
+import net.damagejr05.overseer.core.portal.PortalTransform;
 import net.minecraft.network.packet.s2c.play.ChunkDataS2CPacket;
 import net.minecraft.network.packet.s2c.play.UnloadChunkS2CPacket;
 import net.minecraft.server.MinecraftServer;
@@ -16,8 +17,10 @@ import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -43,7 +46,12 @@ public class RemoteChunkTracker {
     /** How close a player must be to the near anchor before the far side is streamed to them. */
     private static final double ACTIVATION_DISTANCE = 48.0;
 
-    private static final int INTERVAL_TICKS = 20;
+    /**
+     * A full second here was visible: step through and the doorway behind you showed the void
+     * until the next pass came round. The pass itself is a set difference over a few dozen
+     * entries, so there is no reason to make anyone wait for it.
+     */
+    private static final int INTERVAL_TICKS = 5;
 
     /**
      * Chunks currently sent to each player, per dimension.
@@ -67,10 +75,9 @@ public class RemoteChunkTracker {
         for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
             Map<RegistryKey<World>, Set<Long>> wanted = new HashMap<>();
 
-            for (PortalPair pair : doorways.pairs()) {
-                // Standing near either end streams whatever lies beyond the other one.
-                collectIfNear(player, pair.outer(), pair.inner(), wanted);
-                collectIfNear(player, pair.inner(), pair.outer(), wanted);
+            PortalTransform streamed = streamed(player, doorways);
+            if (streamed != null) {
+                collect(streamed.to(), wanted);
             }
 
             sync(server, player, wanted);
@@ -78,24 +85,52 @@ public class RemoteChunkTracker {
     }
 
     /**
-     * If {@code player} is close to {@code near}, mark the chunks around {@code far} for streaming.
+     * The one doorway whose far side is streamed to {@code player}: the nearest one in range.
+     *
+     * <p>One, not all of them. The client holds each remote dimension in a single window of
+     * chunks around a single centre, and two doorways standing side by side can lead to places
+     * thousands of blocks apart -- which is exactly what happens once doorways are opened from
+     * inside the memory dimension. Streaming both sent the client chunks its window could not
+     * hold; it dropped them, this side still counted them as delivered, and that doorway showed
+     * the void from then on. Only one doorway is ever drawn with a live view anyway.
+     *
+     * <p>Shared with the entity tracker, so the two always agree about which place is in view.
      */
-    private static void collectIfNear(ServerPlayerEntity player, PortalAnchor near, PortalAnchor far,
-                                      Map<RegistryKey<World>, Set<Long>> wanted) {
-        if (player.getEntityWorld().getRegistryKey() != near.dimension()) {
-            return;
+    public static @Nullable PortalTransform streamed(ServerPlayerEntity player, DoorwayComponent doorways) {
+        RegistryKey<World> dimension = player.getEntityWorld().getRegistryKey();
+
+        // The portal an eviction opens takes over the view of everyone beneath it, however far
+        // off it hangs: it is the one thing in the sky, and it is about to be where they are.
+        PortalPair eviction = doorways.getEviction();
+        if (eviction != null && eviction.inner().dimension() == dimension
+                && eviction.outer().dimension() != dimension) {
+            return eviction.outward();
         }
 
-        // Never stream a dimension into itself. If both ends of a pair sit in the same world the
-        // player is already in it, and the client must not receive a second, conflicting copy.
-        if (far.dimension() == player.getEntityWorld().getRegistryKey()) {
-            return;
+        PortalTransform best = null;
+        double bestDistance = ACTIVATION_DISTANCE * ACTIVATION_DISTANCE;
+
+        for (PortalPair pair : doorways.pairs()) {
+            PortalTransform candidate = pair.from(dimension);
+
+            // Never stream a dimension into itself. If both ends of a pair sit in the same world
+            // the player is already in it, and the client must not receive a second, conflicting
+            // copy.
+            if (candidate == null || candidate.to().dimension() == dimension) {
+                continue;
+            }
+
+            double distance = player.getEntityPos().squaredDistanceTo(candidate.from().center());
+            if (distance <= bestDistance) {
+                bestDistance = distance;
+                best = candidate;
+            }
         }
 
-        if (player.getEntityPos().squaredDistanceTo(near.center()) > ACTIVATION_DISTANCE * ACTIVATION_DISTANCE) {
-            return;
-        }
+        return best;
+    }
 
+    private static void collect(PortalAnchor far, Map<RegistryKey<World>, Set<Long>> wanted) {
         ChunkPos centre = new ChunkPos(BlockPos.ofFloored(far.center()));
 
         for (int x = -RADIUS; x <= RADIUS; x++) {
@@ -171,5 +206,67 @@ public class RemoteChunkTracker {
 
     public static void forget(ServerPlayerEntity player) {
         SENT.remove(player.getUuid());
+    }
+
+    public static void clear() {
+        SENT.clear();
+    }
+
+    /**
+     * The player has arrived in {@code destination}, and vanilla owns that dimension for them now.
+     *
+     * <p>The client drops its secondary copy the moment it walks in, so the bookkeeping has to be
+     * dropped at the same moment. Leaving it for the next pass loses a race: step through and
+     * straight back inside one interval and this side still believes everything was delivered,
+     * never resends it, and the doorway shows the void until the player walks out of range.
+     */
+    public static void onWorldChange(ServerPlayerEntity player, RegistryKey<World> destination) {
+        Map<RegistryKey<World>, Set<Long>> sent = SENT.get(player.getUuid());
+        if (sent != null) {
+            sent.remove(destination);
+        }
+    }
+
+    /** Whether any of {@code dimension} is currently being streamed to {@code player}. */
+    public static boolean isStreaming(ServerPlayerEntity player, RegistryKey<World> dimension) {
+        Map<RegistryKey<World>, Set<Long>> sent = SENT.get(player.getUuid());
+        if (sent == null) {
+            return false;
+        }
+
+        Set<Long> chunks = sent.get(dimension);
+        return chunks != null && !chunks.isEmpty();
+    }
+
+    /**
+     * Everyone holding a streamed copy of one chunk, so changes to it can follow the original.
+     * Never includes players standing in {@code dimension}: vanilla already updates those.
+     */
+    public static List<ServerPlayerEntity> viewers(MinecraftServer server, RegistryKey<World> dimension, ChunkPos pos) {
+        if (SENT.isEmpty()) {
+            return List.of();
+        }
+
+        long key = pos.toLong();
+        List<ServerPlayerEntity> result = null;
+
+        for (Map.Entry<UUID, Map<RegistryKey<World>, Set<Long>>> entry : SENT.entrySet()) {
+            Set<Long> chunks = entry.getValue().get(dimension);
+            if (chunks == null || !chunks.contains(key)) {
+                continue;
+            }
+
+            ServerPlayerEntity player = server.getPlayerManager().getPlayer(entry.getKey());
+            if (player == null || player.getEntityWorld().getRegistryKey() == dimension) {
+                continue;
+            }
+
+            if (result == null) {
+                result = new ArrayList<>(1);
+            }
+            result.add(player);
+        }
+
+        return result == null ? List.of() : result;
     }
 }

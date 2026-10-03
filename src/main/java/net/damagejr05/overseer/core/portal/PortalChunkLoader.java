@@ -25,10 +25,12 @@ public class PortalChunkLoader {
     /**
      * Chunk radius held around each anchor.
      *
-     * <p>Must be at least the radius RemoteChunkTracker streams, or the outer ring is never
-     * generated server-side and so never reaches the client to be rendered.
+     * <p>One more than the radius RemoteChunkTracker streams. A ticket's level falls off by one
+     * per chunk and the outermost ring it reaches is loaded but not ticking, and a chunk that is
+     * not ticking never broadcasts block changes -- so at an equal radius the edge of the streamed
+     * area would arrive once and then never update.
      */
-    private static final int RADIUS = 4;
+    private static final int RADIUS = 5;
 
     /** Ticket lifetime comfortably exceeds this, so the refresh never leaves a gap. */
     private static final int REFRESH_INTERVAL_TICKS = 100;

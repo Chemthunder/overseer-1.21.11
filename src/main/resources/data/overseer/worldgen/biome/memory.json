@@ -6,6 +6,14 @@
     "water_color": "#0B0C10"
   },
   "attributes": {
+    "minecraft:visual/ambient_particles": [
+      {
+        "particle": {
+          "type": "minecraft:white_ash"
+        },
+        "probability": 0.03
+      }
+    ],
     "minecraft:visual/fog_color": "#0B0C10",
     "minecraft:visual/sky_color": "#0B0C10",
     "minecraft:visual/fog_start_distance": 8.0,

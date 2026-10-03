@@ -36,3 +36,25 @@ accessible method net/minecraft/client/render/GameRenderer getProjectionMatrix (
 accessible field net/minecraft/client/render/Camera environmentAttributeInterpolator Lnet/minecraft/world/attribute/EnvironmentAttributeInterpolator;
 mutable field net/minecraft/client/render/Camera environmentAttributeInterpolator Lnet/minecraft/world/attribute/EnvironmentAttributeInterpolator;
 accessible method net/minecraft/client/render/GameRenderer getSkyDarkness (F)F
+
+
+# Brightness is a lookup into one global lightmap texture, built from the dimension the player is
+# standing in. Seen from the memory dimension -- no skylight, fixed ambient -- the overworld was lit
+# as though it were the memory dimension too, at any hour. The portal render swaps in a lightmap
+# of its own, built for the dimension it is looking into.
+accessible field net/minecraft/client/render/GameRenderer lightmapTextureManager Lnet/minecraft/client/render/LightmapTextureManager;
+mutable field net/minecraft/client/render/GameRenderer lightmapTextureManager Lnet/minecraft/client/render/LightmapTextureManager;
+
+# Stepping through a doorway hands the already-loaded far world over to vanilla instead of letting
+# it build an empty one. The world renderer that comes with it draws from its own render state, and
+# the game renderer fills in the camera on the one it holds, so the two have to change hands
+# together. The network handler likewise keeps the world's properties object for itself.
+accessible field net/minecraft/client/render/GameRenderer worldRenderState Lnet/minecraft/client/render/state/WorldRenderState;
+mutable field net/minecraft/client/render/GameRenderer worldRenderState Lnet/minecraft/client/render/state/WorldRenderState;
+accessible field net/minecraft/client/network/ClientPlayNetworkHandler worldProperties Lnet/minecraft/client/world/ClientWorld$Properties;
+
+# Vanilla registers its one cloud renderer as a resource reloader, which is the only thing that
+# ever loads the cloud texture into it. A renderer built here never gets that call, so it has
+# to be made directly, or the dimension it draws has no clouds.
+accessible method net/minecraft/client/render/CloudRenderer prepare (Lnet/minecraft/resource/ResourceManager;Lnet/minecraft/util/profiler/Profiler;)Ljava/util/Optional;
+accessible method net/minecraft/client/render/CloudRenderer apply (Ljava/util/Optional;Lnet/minecraft/resource/ResourceManager;Lnet/minecraft/util/profiler/Profiler;)V

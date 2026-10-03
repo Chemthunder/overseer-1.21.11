@@ -7,13 +7,19 @@ import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.ints.IntSet;
 import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
 import net.damagejr05.overseer.core.portal.PortalAnchor;
-import net.damagejr05.overseer.core.portal.PortalPair;
+import net.damagejr05.overseer.core.portal.PortalTransform;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.data.DataTracker;
 import net.minecraft.item.ItemStack;
+import net.minecraft.network.listener.ClientPlayPacketListener;
+import net.minecraft.network.packet.Packet;
 import net.minecraft.network.packet.s2c.play.EntitiesDestroyS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityAttachS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityPassengersSetS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityPositionS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityEquipmentUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityPositionSyncS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntitySetHeadYawS2CPacket;
@@ -46,6 +52,10 @@ import java.util.UUID;
  * sphere around one anchor -- and a portal view is only ever a few dozen blocks deep. Correctness
  * under teleports, vehicles and rubber-banding comes for free when nothing is incremental.
  *
+ * <p>Everything that is <em>not</em> movement -- tracked data, equipment, attributes, swings, hurt
+ * and death animations -- is not re-derived here at all. Vanilla's own tracker already works out
+ * exactly when each of those changes, so {@link #forward} simply copies what it broadcasts.
+ *
  * @author Flex
  */
 public class RemoteEntityTracker {
@@ -64,39 +74,87 @@ public class RemoteEntityTracker {
      */
     private static final Map<UUID, Map<RegistryKey<World>, IntSet>> SENT = new HashMap<>();
 
+    /**
+     * Every id streamed to anyone, rebuilt each tick.
+     *
+     * <p>{@link #forward} is called for every packet every tracked entity on the server
+     * broadcasts, and almost none of them are near a doorway. This turns the common case into a
+     * single lookup.
+     */
+    private static final IntSet STREAMED = new IntOpenHashSet();
+
     public static void tick(MinecraftServer server) {
         DoorwayComponent doorways = DoorwayComponent.get(server);
 
         for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
             Map<RegistryKey<World>, List<Entity>> wanted = new HashMap<>();
 
-            for (PortalPair pair : doorways.pairs()) {
-                // Standing near either end streams whatever stands beyond the other one.
-                collectIfNear(server, player, pair.outer(), pair.inner(), wanted);
-                collectIfNear(server, player, pair.inner(), pair.outer(), wanted);
+            // The same doorway the chunk tracker is streaming terrain for, and no other.
+            PortalTransform streamed = RemoteChunkTracker.streamed(player, doorways);
+            if (streamed != null) {
+                collect(server, player, streamed.to(), wanted);
             }
 
             sync(player, wanted);
         }
+
+        STREAMED.clear();
+        for (Map<RegistryKey<World>, IntSet> perPlayer : SENT.values()) {
+            for (IntSet ids : perPlayer.values()) {
+                STREAMED.addAll(ids);
+            }
+        }
     }
 
-    private static void collectIfNear(MinecraftServer server, ServerPlayerEntity player,
-                                      PortalAnchor near, PortalAnchor far,
-                                      Map<RegistryKey<World>, List<Entity>> wanted) {
-        if (player.getEntityWorld().getRegistryKey() != near.dimension()) {
+    /**
+     * Copy a packet vanilla is broadcasting about {@code entity} to everyone watching it through
+     * a portal. Called from the tracker's own send path, so it sees every update vanilla makes.
+     */
+    public static void forward(Entity entity, Packet<? super ClientPlayPacketListener> packet) {
+        if (STREAMED.isEmpty() || !STREAMED.contains(entity.getId()) || isHandledHere(packet)) {
             return;
         }
 
-        // A pair with both ends in one dimension needs nothing streamed: the client already has
-        // every entity there, and sending duplicates would spawn a second copy of each.
-        if (far.dimension() == player.getEntityWorld().getRegistryKey()) {
+        if (!(entity.getEntityWorld() instanceof ServerWorld world) || !world.getServer().isOnThread()) {
             return;
         }
 
-        if (player.getEntityPos().squaredDistanceTo(near.center()) > ACTIVATION_DISTANCE * ACTIVATION_DISTANCE) {
-            return;
-        }
+        RegistryKey<World> dimension = world.getRegistryKey();
 
+        for (Map.Entry<UUID, Map<RegistryKey<World>, IntSet>> entry : SENT.entrySet()) {
+            IntSet ids = entry.getValue().get(dimension);
+            if (ids == null || !ids.contains(entity.getId())) {
+                continue;
+            }
+
+            ServerPlayerEntity player = world.getServer().getPlayerManager().getPlayer(entry.getKey());
+
+            // Anyone standing in the entity's own world is already one of vanilla's listeners.
+            if (player == null || player.getEntityWorld() == world) {
+                continue;
+            }
+
+            player.networkHandler.sendPacket(PacketRedirection.wrap(dimension, packet));
+        }
+    }
+
+    /**
+     * Movement is sent absolutely by {@link #sync} every tick; vanilla's relative moves are deltas
+     * against a baseline the remote client never had. Passenger and leash packets name a second
+     * entity that may well not be streamed, and the client logs a warning for each one it cannot
+     * resolve.
+     */
+    private static boolean isHandledHere(Packet<?> packet) {
+        return packet instanceof EntityS2CPacket
+                || packet instanceof EntityPositionSyncS2CPacket
+                || packet instanceof EntityPositionS2CPacket
+                || packet instanceof EntitySetHeadYawS2CPacket
+                || packet instanceof EntityPassengersSetS2CPacket
+                || packet instanceof EntityAttachS2CPacket;
+    }
+
+    private static void collect(MinecraftServer server, ServerPlayerEntity player, PortalAnchor far,
+                                Map<RegistryKey<World>, List<Entity>> wanted) {
         ServerWorld world = server.getWorld(far.dimension());
         if (world == null) {
             return;
@@ -197,5 +255,21 @@ public class RemoteEntityTracker {
     /** Drop a player's bookkeeping. Their client is gone, so nothing needs retiring first. */
     public static void forget(ServerPlayerEntity player) {
         SENT.remove(player.getUuid());
+    }
+
+    /**
+     * See {@link RemoteChunkTracker#onWorldChange}. The client has already thrown away its copy of
+     * {@code destination}, entities included, so there is nothing to retire.
+     */
+    public static void onWorldChange(ServerPlayerEntity player, RegistryKey<World> destination) {
+        Map<RegistryKey<World>, IntSet> sent = SENT.get(player.getUuid());
+        if (sent != null) {
+            sent.remove(destination);
+        }
+    }
+
+    public static void clear() {
+        SENT.clear();
+        STREAMED.clear();
     }
 }

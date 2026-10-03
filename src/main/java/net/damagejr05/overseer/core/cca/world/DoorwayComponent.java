@@ -2,8 +2,11 @@ package net.damagejr05.overseer.core.cca.world;
 
 import net.damagejr05.overseer.core.Overseer;
 import net.damagejr05.overseer.core.index.ModDimensions;
+import net.damagejr05.overseer.core.portal.Eviction;
 import net.damagejr05.overseer.core.portal.PortalAnchor;
 import net.damagejr05.overseer.core.portal.PortalPair;
+import net.damagejr05.overseer.core.portal.PortalTransform;
+import net.minecraft.entity.Entity;
 import net.minecraft.particle.ParticleTypes;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
@@ -56,6 +59,28 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
     private int openTicks = OPEN_TICKS;
 
     /**
+     * Whether anyone but the Overseer may walk through a doorway. Closed by default: a doorway
+     * is the Overseer's until they say otherwise.
+     */
+    private boolean admitting = false;
+
+    /**
+     * Where the eviction sequence has got to, in ticks; zero when none is running. See
+     * {@link Eviction} for what happens when.
+     *
+     * <p>Synced when it starts and advanced locally by every copy after that, so the sky's
+     * animation runs smoothly on a client instead of stepping with each sync.
+     */
+    private int evictionTicks = 0;
+
+    /**
+     * The portal in the sky that an eviction throws people through: its {@code inner} end hangs
+     * over the memory dimension, its {@code outer} end over the overworld. Exists only while a
+     * sequence is running.
+     */
+    private @Nullable PortalPair eviction = null;
+
+    /**
      * Server-side tick counter. This previously read OverseerClient.age, a client-only static that
      * is permanently zero on a dedicated server.
      */
@@ -102,6 +127,18 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
             return;
         }
 
+        if (evictionTicks > 0) {
+            if (server != null) {
+                Eviction.tick(server, evictionTicks);
+            }
+
+            if (++evictionTicks > Eviction.TOTAL_TICKS) {
+                evictionTicks = 0;
+                eviction = null;
+                sync();
+            }
+        }
+
         // Re-mirror periodically. Each world persists its own copy, so after a restart the
         // non-canonical ones can hold stale state until the next change would have fixed them.
         if (age % 20 == 0) {
@@ -145,6 +182,9 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
         if (dynamic != null) {
             result.add(dynamic);
         }
+        if (eviction != null) {
+            result.add(eviction);
+        }
 
         return result;
     }
@@ -167,7 +207,16 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
      * 0 while the opening is still growing, 1 once fully open.
      */
     public float openProgress() {
-        return Math.min(1.0F, openTicks / (float) OPEN_TICKS);
+        return openProgress(0.0F);
+    }
+
+    /** As above, smoothed between ticks for rendering. */
+    public float openProgress(float tickProgress) {
+        if (openTicks >= OPEN_TICKS) {
+            return 1.0F;
+        }
+
+        return Math.min(1.0F, (openTicks + tickProgress) / OPEN_TICKS);
     }
 
     public void sync() {
@@ -201,8 +250,86 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
         dynamic = source.dynamic;
         dynamicDuration = source.dynamicDuration;
         openTicks = source.openTicks;
+        admitting = source.admitting;
+        evictionTicks = source.evictionTicks;
+        eviction = source.eviction;
 
         KEY.sync(world);
+    }
+
+    /**
+     * Client-side: take on another world's copy of the doorways without syncing anything.
+     *
+     * <p>Each client world has its own copy, filled in by the server's sync for the world the
+     * player is in. A world the player has just arrived in has not had that sync yet, and for the
+     * tick or so until it lands every doorway -- including the one just walked through -- would
+     * not exist. The world they came from holds exactly the right state already.
+     */
+    public void copyFrom(DoorwayComponent source) {
+        fixed = source.fixed;
+        dynamic = source.dynamic;
+        dynamicDuration = source.dynamicDuration;
+        openTicks = source.openTicks;
+        admitting = source.admitting;
+        evictionTicks = source.evictionTicks;
+        eviction = source.eviction;
+    }
+
+    public boolean isAdmitting() {
+        return admitting;
+    }
+
+    public void setAdmitting(boolean value) {
+        admitting = value;
+        sync();
+    }
+
+    /**
+     * Whether {@code entity} may pass through a doorway. Anything that is not a player always
+     * may; a player may if they are the Overseer or the doorways have been opened to everyone.
+     * The one rule both the server's teleport and the client's collision go by.
+     */
+    public boolean mayEnter(Entity entity) {
+        return admitting || !(entity instanceof net.minecraft.entity.player.PlayerEntity) || Overseer.isOverseer(entity);
+    }
+
+    public int evictionTicks() {
+        return evictionTicks;
+    }
+
+    public @Nullable PortalPair getEviction() {
+        return eviction;
+    }
+
+    /** Whether {@code anchor} is one end of the eviction's portal in the sky. */
+    public boolean isEvictionAnchor(PortalAnchor anchor) {
+        return eviction != null && (anchor.equals(eviction.inner()) || anchor.equals(eviction.outer()));
+    }
+
+    /**
+     * Whether {@code entity} may go through one particular doorway, in one direction.
+     *
+     * <p>The portal an eviction opens is not a doorway anyone is being let into: it takes
+     * everybody, whatever the access setting, and only ever outward.
+     */
+    public boolean mayPass(Entity entity, PortalTransform transform) {
+        if (isEvictionAnchor(transform.from())) {
+            return eviction != null && transform.from().equals(eviction.inner());
+        }
+
+        return mayEnter(entity);
+    }
+
+    /** Begin the eviction sequence through {@code portal}, unless one is already under way. */
+    public boolean startEviction(PortalPair portal) {
+        if (evictionTicks > 0) {
+            return false;
+        }
+
+        eviction = portal;
+        evictionTicks = 1;
+        sync();
+        return true;
     }
 
     public void readData(ReadView readView) {
@@ -211,6 +338,9 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
 
         dynamicDuration = readView.getInt("DynamicDuration", 0);
         openTicks = readView.getInt("OpenTicks", OPEN_TICKS);
+        admitting = readView.getBoolean("Admitting", false);
+        evictionTicks = readView.getInt("EvictionTicks", 0);
+        eviction = readView.read("Eviction", PortalPair.CODEC).orElse(null);
     }
 
     public void writeData(WriteView writeView) {
@@ -223,6 +353,11 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
 
         writeView.putInt("DynamicDuration", dynamicDuration);
         writeView.putInt("OpenTicks", openTicks);
+        writeView.putBoolean("Admitting", admitting);
+        writeView.putInt("EvictionTicks", evictionTicks);
+        if (eviction != null) {
+            writeView.put("Eviction", PortalPair.CODEC, eviction);
+        }
     }
 
     public @Nullable PortalPair getFixed() {
@@ -250,7 +385,12 @@ public class DoorwayComponent implements AutoSyncedComponent, CommonTickingCompo
      * overworld position, scaled down.
      */
     public void openDynamic(PortalAnchor overworld, int durationTicks) {
-        dynamic = new PortalPair(overworld, ModDimensions.dynamicMemoryAnchor(overworld));
+        openDynamic(new PortalPair(overworld, ModDimensions.dynamicMemoryAnchor(overworld)), durationTicks);
+    }
+
+    /** Open the temporary doorway with both ends already decided. */
+    public void openDynamic(PortalPair pair, int durationTicks) {
+        dynamic = pair;
         dynamicDuration = durationTicks;
         openTicks = 0;
         sync();

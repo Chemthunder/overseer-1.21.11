@@ -3,6 +3,9 @@
   "package": "net.damagejr05.overseer.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
+    "ChunkHolderMixin",
+    "EntityMixin",
+    "EntityTrackerMixin",
     "LivingEntityMixin",
     "MobEntityMixin",
     "PlayerEntityMixin",
@@ -22,7 +25,9 @@
     "client.EntityRenderManagerMixin",
     "client.GameRendererMixin",
     "client.NebulonClientMixin",
+    "client.NebulonLateBridgeMixin",
     "client.InGameHudMixin",
-    "client.PlayerListHudMixin"
+    "client.PlayerListHudMixin",
+    "client.WorldRendererMixin"
   ]
 }

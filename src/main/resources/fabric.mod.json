@@ -34,7 +34,7 @@
     "minecraft": "~1.21.11",
     "java": ">=21",
     "fabric-api": "*",
-    "nebulon": ">=0.1.1-beta"
+    "nebulon": ">=0.1.2-beta"
   },
   "custom": {
     "cardinal-components": [

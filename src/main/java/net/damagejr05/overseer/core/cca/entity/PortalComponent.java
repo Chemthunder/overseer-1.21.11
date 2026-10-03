@@ -9,6 +9,7 @@ import net.damagejr05.overseer.core.portal.PortalTransform;
 import net.damagejr05.overseer.core.net.PortalTransitionPayload;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -17,6 +18,7 @@ import net.minecraft.storage.WriteView;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.TeleportTarget;
+import net.minecraft.world.World;
 import org.jetbrains.annotations.Nullable;
 import org.ladysnake.cca.api.v3.component.ComponentKey;
 import org.ladysnake.cca.api.v3.component.ComponentRegistry;
@@ -40,8 +42,21 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
 
     private final PlayerEntity player;
 
+    /**
+     * The furthest a player can plausibly travel in one tick, in blocks.
+     *
+     * <p>The sweep cannot tell walking from being moved. A /tp, a respawn, an ender pearl or a
+     * chorus fruit all show up as one long segment, and any that happens to pass through the
+     * opening would otherwise count as stepping through it and send the player to the other
+     * dimension. Nothing on foot, in flight or under a riptide comes close to this.
+     */
+    private static final double MAX_STEP = 8.0;
+
     /** Body-centre position last tick, used as the start of the swept segment. */
     private @Nullable Vec3d previousPos = null;
+
+    /** The dimension {@link #previousPos} was sampled in. */
+    private @Nullable RegistryKey<World> previousDimension = null;
 
     public PortalComponent(PlayerEntity player) {
         this.player = player;
@@ -49,11 +64,27 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
 
     public void tick() {
         Vec3d current = samplePos();
+        RegistryKey<World> dimension = player.getEntityWorld().getRegistryKey();
 
         Vec3d previous = previousPos;
+        boolean sameDimension = previousDimension == dimension;
+
         previousPos = current;
+        previousDimension = dimension;
 
         if (previous == null || player.getEntityWorld().isClient()) {
+            return;
+        }
+
+        // In a boat or on a horse, the vehicle is what crosses and it brings its riders with it.
+        // Crossing here as well would pull the player off its back half way through the doorway.
+        if (player.hasVehicle()) {
+            return;
+        }
+
+        // Two positions in different dimensions do not describe a movement at all, and neither
+        // does a jump no player could have made. See MAX_STEP.
+        if (!sameDimension || previous.squaredDistanceTo(current) > MAX_STEP * MAX_STEP) {
             return;
         }
 
@@ -62,18 +93,17 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
             return;
         }
 
-        // Portals are visible to everyone but only the Overseer may pass through them.
-        if (!Overseer.isOverseer(player)) {
-            return;
-        }
-
         DoorwayComponent doorways = DoorwayComponent.get(server);
+
 
         // Each pair has an end in this dimension at most once, so at most one crossing can fire.
         for (PortalPair pair : doorways.pairs()) {
             PortalTransform transform = pair.from(player.getEntityWorld().getRegistryKey());
 
-            if (transform != null && tryCross(server, transform, previous, current)) {
+            // Portals are visible to everyone, but who may pass through them is the Overseer's to
+            // say -- except the one an eviction opens, which takes everybody.
+            if (transform != null && doorways.mayPass(player, transform)
+                    && tryCross(server, transform, previous, current)) {
                 return;
             }
         }
@@ -108,7 +138,10 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
         destination.getChunk(BlockPos.ofFloored(exitFeet));
 
         // Warn the client before the dimension change lands, so it can skip the loading screen.
-        if (player instanceof ServerPlayerEntity serverPlayer) {
+        // Only when there is a dimension change to cover: a pair with both ends in one world
+        // teleports in place, nothing consumes the flag, and it would then swallow the loading
+        // screen of whatever unrelated dimension change came next.
+        if (player instanceof ServerPlayerEntity serverPlayer && destination != player.getEntityWorld()) {
             ServerPlayNetworking.send(serverPlayer, PortalTransitionPayload.INSTANCE);
         }
 
@@ -128,6 +161,7 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
         // The swept segment must not span the teleport, or the next tick would look like a huge
         // jump straight back through the exit portal.
         previousPos = samplePos();
+        previousDimension = player.getEntityWorld().getRegistryKey();
 
         return true;
     }
