@@ -19,7 +19,9 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -64,6 +66,29 @@ public class RemoteChunkTracker {
     private static final Map<UUID, Map<RegistryKey<World>, Set<Long>>> SENT = new HashMap<>();
 
     private static int counter = 0;
+
+    /**
+     * The most chunks sent to one player in one pass.
+     *
+     * <p>Vanilla meters the chunks it sends; this did not, and the whole area went out in a single
+     * tick -- every time a doorway came into range and again after every crossing. The client
+     * applies each one on its render thread, so that was a hitch for the player and a burst on
+     * the connection. The area now fills in from the doorway outwards over a second or so.
+     */
+    private static final int MAX_CHUNKS_PER_PASS = 16;
+
+    /** Every offset within {@link #RADIUS}, the anchor's own chunk first. */
+    private static final List<ChunkPos> NEAREST_FIRST = new ArrayList<>();
+
+    static {
+        for (int x = -RADIUS; x <= RADIUS; x++) {
+            for (int z = -RADIUS; z <= RADIUS; z++) {
+                NEAREST_FIRST.add(new ChunkPos(x, z));
+            }
+        }
+
+        NEAREST_FIRST.sort(Comparator.comparingInt(offset -> offset.x * offset.x + offset.z * offset.z));
+    }
 
     public static void tick(MinecraftServer server) {
         if (counter++ % INTERVAL_TICKS != 0) {
@@ -133,11 +158,11 @@ public class RemoteChunkTracker {
     private static void collect(PortalAnchor far, Map<RegistryKey<World>, Set<Long>> wanted) {
         ChunkPos centre = new ChunkPos(BlockPos.ofFloored(far.center()));
 
-        for (int x = -RADIUS; x <= RADIUS; x++) {
-            for (int z = -RADIUS; z <= RADIUS; z++) {
-                wanted.computeIfAbsent(far.dimension(), key -> new HashSet<>())
-                        .add(ChunkPos.toLong(centre.x + x, centre.z + z));
-            }
+        // Insertion-ordered, so the pass sends what is nearest the doorway first.
+        Set<Long> chunks = wanted.computeIfAbsent(far.dimension(), key -> new LinkedHashSet<>());
+
+        for (ChunkPos offset : NEAREST_FIRST) {
+            chunks.add(ChunkPos.toLong(centre.x + offset.x, centre.z + offset.z));
         }
     }
 
@@ -169,6 +194,8 @@ public class RemoteChunkTracker {
             sent.put(dimension, entry.getValue());
         }
 
+        int budget = MAX_CHUNKS_PER_PASS;
+
         for (Map.Entry<RegistryKey<World>, Set<Long>> entry : wanted.entrySet()) {
             RegistryKey<World> dimension = entry.getKey();
 
@@ -182,6 +209,11 @@ public class RemoteChunkTracker {
             for (Long key : entry.getValue()) {
                 if (alreadySent.contains(key)) {
                     continue;
+                }
+
+                // The rest goes out on the passes that follow.
+                if (budget == 0) {
+                    return;
                 }
 
                 ChunkPos pos = new ChunkPos(key);
@@ -200,6 +232,7 @@ public class RemoteChunkTracker {
                 );
 
                 alreadySent.add(key);
+                budget--;
             }
         }
     }

@@ -32,6 +32,8 @@ import org.jetbrains.annotations.Nullable;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -76,6 +78,75 @@ public class SecondaryWorldManager {
     private static final int EMPTY_TICKS_BEFORE_DISPOSAL = 200;
 
     private static final Map<RegistryKey<World>, Integer> EMPTY_TICKS = new HashMap<>();
+
+    /**
+     * How long a secondary world may go without a single packet from the server before it is
+     * dropped, chunks or no chunks, in ticks.
+     *
+     * <p>The server sends the clock of every dimension it is streaming once a second, so silence
+     * this long means it has stopped. That happens with chunks still held after a crossing: the
+     * world just left keeps a ring of terrain the server never streamed and so never unloads,
+     * which kept it from ever counting as empty and left it ticking for the rest of the session.
+     */
+    private static final int SILENT_TICKS_BEFORE_DISPOSAL = 200;
+
+    /** The tick each secondary world last heard from the server on. */
+    private static final Map<RegistryKey<World>, Integer> LAST_STREAMED = new HashMap<>();
+
+    /** Counts unpaused client ticks. A paused integrated server sends nothing, and that is not silence. */
+    private static int ticks = 0;
+
+    /** A redirected packet for {@code dimension} has just arrived. */
+    public static void noteStreamed(RegistryKey<World> dimension) {
+        LAST_STREAMED.put(dimension, ticks);
+    }
+
+    /**
+     * A renderer's buffer storage, and how many block buffer sets its pool holds when none is out
+     * with a meshing task.
+     */
+    private record PooledBuffers(BufferBuilderStorage storage, int builders) {
+    }
+
+    /**
+     * Buffer storage is recycled between secondary renderers rather than made for each.
+     *
+     * <p>It is several megabytes of native memory per processor, nothing in vanilla ever frees
+     * one -- it only has the one, for the life of the game -- and a renderer is built here every
+     * time a doorway comes back into range. Making a new storage each time grew the process by a
+     * hundred megabytes or more per doorway approached until the machine ran out.
+     *
+     * <p>Freeing it when the renderer closes is not safe either: a meshing task still running on
+     * a worker thread may be holding one of its buffers. So a closed renderer's storage is kept
+     * and handed to the next renderer once every buffer is back in its pool.
+     */
+    private static final Map<WorldRenderer, PooledBuffers> BUFFERS_IN_USE = new IdentityHashMap<>();
+    private static final List<PooledBuffers> SPARE_BUFFERS = new ArrayList<>();
+
+    private static PooledBuffers acquireBuffers() {
+        for (Iterator<PooledBuffers> spares = SPARE_BUFFERS.iterator(); spares.hasNext(); ) {
+            PooledBuffers spare = spares.next();
+
+            // A task from the renderer that last had it is still out. Leave it for next time.
+            if (spare.storage().getBlockBufferBuildersPool().getAvailableBuilderCount() == spare.builders()) {
+                spares.remove();
+                return spare;
+            }
+        }
+
+        // Sized the way vanilla sizes its own. Passing 0 starves the chunk builder of block
+        // buffer builders and stalls terrain meshing.
+        BufferBuilderStorage storage = new BufferBuilderStorage(Runtime.getRuntime().availableProcessors());
+        return new PooledBuffers(storage, storage.getBlockBufferBuildersPool().getAvailableBuilderCount());
+    }
+
+    /** {@code renderer} has been closed; its storage is free for the next one. */
+    private static void releaseBuffers(WorldRenderer renderer) {
+        PooledBuffers pooled = BUFFERS_IN_USE.remove(renderer);
+        if (pooled != null) {
+            SPARE_BUFFERS.add(pooled);
+        }
+    }
 
     /** Framebuffer size the secondary renderers were last sized for. */
     private static int sizedWidth = -1;
@@ -194,6 +265,8 @@ public class SecondaryWorldManager {
             return null;
         }
 
+        PooledBuffers pooled = acquireBuffers();
+
         try {
             // Everything per-frame and mutable is its own. Sharing any of these would have two
             // renderers writing the same buffers within one frame, which corrupts both.
@@ -202,12 +275,7 @@ public class SecondaryWorldManager {
             // block-entity rendering submits into. Sharing it meant the portal render's commands
             // and the main render's commands landed in one queue and were flushed together with
             // mismatched camera and buffer state.
-            //
-            // The storage is sized the way vanilla sizes its own. Passing 0 starves the secondary
-            // chunk builder of block buffer builders and stalls terrain meshing.
-            BufferBuilderStorage buffers = new BufferBuilderStorage(
-                    Runtime.getRuntime().availableProcessors()
-            );
+            BufferBuilderStorage buffers = pooled.storage();
 
             RenderDispatcher dispatcher = new RenderDispatcher(
                     new OrderedRenderCommandQueueImpl(),
@@ -229,6 +297,8 @@ public class SecondaryWorldManager {
                     renderState,
                     dispatcher
             );
+
+            BUFFERS_IN_USE.put(renderer, pooled);
 
             DISPATCHERS.put(dimension, dispatcher);
             RENDER_STATES.put(dimension, renderState);
@@ -268,6 +338,7 @@ public class SecondaryWorldManager {
 
             WORLDS.put(dimension, world);
             RENDERERS.put(dimension, renderer);
+            LAST_STREAMED.put(dimension, ticks);
 
             // The clock starts at zero and the server's first sync is up to a second away. The
             // player's own world is a far better guess than tick zero in the meantime: every
@@ -278,6 +349,8 @@ public class SecondaryWorldManager {
             return world;
         } catch (Exception e) {
             Overseer.LOGGER.error("Failed to create secondary client world {}", dimension.getValue(), e);
+            BUFFERS_IN_USE.values().remove(pooled);
+            SPARE_BUFFERS.add(pooled);
             return null;
         }
     }
@@ -337,6 +410,10 @@ public class SecondaryWorldManager {
 
     public static void tick() {
         MinecraftClient client = MinecraftClient.getInstance();
+
+        if (!client.isPaused()) {
+            ticks++;
+        }
 
         if (client.world != null) {
             RegistryKey<World> current = client.world.getRegistryKey();
@@ -507,10 +584,12 @@ public class SecondaryWorldManager {
         RENDER_STATES.remove(dimension);
         RenderDispatcher incomingDispatcher = DISPATCHERS.remove(dimension);
         EMPTY_TICKS.remove(dimension);
+        LAST_STREAMED.remove(dimension);
         PacketRedirectionClient.forget(dimension);
         PortalViewRenderer.forget(dimension);
 
         WORLDS.put(outgoingDimension, outgoing);
+        LAST_STREAMED.put(outgoingDimension, ticks);
         RENDERERS.put(outgoingDimension, client.worldRenderer);
         RENDER_STATES.put(outgoingDimension, client.gameRenderer.worldRenderState);
         if (primaryDispatcher != null) {
@@ -638,12 +717,14 @@ public class SecondaryWorldManager {
         List<RegistryKey<World>> expired = null;
 
         for (Map.Entry<RegistryKey<World>, ClientWorld> entry : WORLDS.entrySet()) {
-            if (entry.getValue().getChunkManager().getLoadedChunkCount() > 0) {
+            boolean abandoned = ticks - LAST_STREAMED.getOrDefault(entry.getKey(), ticks) >= SILENT_TICKS_BEFORE_DISPOSAL;
+
+            if (!abandoned && entry.getValue().getChunkManager().getLoadedChunkCount() > 0) {
                 EMPTY_TICKS.remove(entry.getKey());
                 continue;
             }
 
-            if (EMPTY_TICKS.merge(entry.getKey(), 1, Integer::sum) >= EMPTY_TICKS_BEFORE_DISPOSAL) {
+            if (abandoned || EMPTY_TICKS.merge(entry.getKey(), 1, Integer::sum) >= EMPTY_TICKS_BEFORE_DISPOSAL) {
                 if (expired == null) {
                     expired = new ArrayList<>(1);
                 }
@@ -697,11 +778,13 @@ public class SecondaryWorldManager {
             // resource reloader and goes back into service on disconnect.
             if (renderer != vanillaRenderer) {
                 renderer.close();
+                releaseBuffers(renderer);
             }
         }
 
         RENDER_STATES.remove(dimension);
         EMPTY_TICKS.remove(dimension);
+        LAST_STREAMED.remove(dimension);
         PortalViewRenderer.forget(dimension);
 
         if (dimension == trimDimension) {
@@ -730,6 +813,7 @@ public class SecondaryWorldManager {
 
                 if (renderer != vanillaRenderer) {
                     renderer.close();
+                    releaseBuffers(renderer);
                 }
             }
         }
@@ -749,6 +833,7 @@ public class SecondaryWorldManager {
 
             standIn.setWorld(null);
             standIn.close();
+            releaseBuffers(standIn);
 
             if (primaryDispatcher != null) {
                 primaryDispatcher.close();
@@ -768,6 +853,7 @@ public class SecondaryWorldManager {
         DISPATCHERS.clear();
         RENDER_STATES.clear();
         EMPTY_TICKS.clear();
+        LAST_STREAMED.clear();
         swapped = false;
         lastDimension = null;
     }

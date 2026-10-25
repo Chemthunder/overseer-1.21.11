@@ -1,6 +1,8 @@
 package net.damagejr05.overseer.core.net;
 
 import com.mojang.datafixers.util.Pair;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
@@ -47,10 +49,11 @@ import java.util.UUID;
  * the blocks, this one sends everything that moves.
  *
  * <p>This is a deliberately simple tracker rather than a second copy of vanilla's
- * {@code EntityTrackerEntry}. It re-sends an absolute position for every visible entity every
- * tick instead of maintaining delta state, because the set it covers is small and bounded -- one
- * sphere around one anchor -- and a portal view is only ever a few dozen blocks deep. Correctness
- * under teleports, vehicles and rubber-banding comes for free when nothing is incremental.
+ * {@code EntityTrackerEntry}. Positions are always sent absolutely rather than as deltas, so
+ * teleports, vehicles and rubber-banding need no special handling -- but only when they have
+ * changed. Sending every entity every tick, as this once did, was two packets a tick for each
+ * item frame, armour stand and sleeping cow near the far side of a doorway, to every player near
+ * the near side, and around a built-up base that drowned the connection.
  *
  * <p>Everything that is <em>not</em> movement -- tracked data, equipment, attributes, swings, hurt
  * and death animations -- is not re-derived here at all. Vanilla's own tracker already works out
@@ -65,14 +68,30 @@ public class RemoteEntityTracker {
     /** How close a player must be to the near anchor before the far side is streamed to them. */
     private static final double ACTIVATION_DISTANCE = 48.0;
 
+    /** Where an entity was, and which way it faced, when a player was last told. */
+    private record Motion(double x, double y, double z, float yaw, float pitch, boolean onGround, byte headYaw) {
+        static Motion of(Entity entity) {
+            return new Motion(
+                    entity.getX(), entity.getY(), entity.getZ(),
+                    entity.getYaw(), entity.getPitch(), entity.isOnGround(),
+                    (byte) MathHelper.floor(entity.getHeadYaw() * 256.0F / 360.0F)
+            );
+        }
+
+        boolean movedSince(Motion before) {
+            return x != before.x || y != before.y || z != before.z
+                    || yaw != before.yaw || pitch != before.pitch || onGround != before.onGround;
+        }
+    }
+
     /**
-     * Entity ids currently sent to each player, per dimension.
+     * Entities currently sent to each player, per dimension, by id, with what was last sent.
      *
      * <p>Keyed by dimension first for the same reason the chunk tracker is: the two ends of a pair
      * are frequently in the same place in their own coordinate spaces, and a flat key would let
      * one dimension's bookkeeping mask the other's.
      */
-    private static final Map<UUID, Map<RegistryKey<World>, IntSet>> SENT = new HashMap<>();
+    private static final Map<UUID, Map<RegistryKey<World>, Int2ObjectMap<Motion>>> SENT = new HashMap<>();
 
     /**
      * Every id streamed to anyone, rebuilt each tick.
@@ -99,9 +118,9 @@ public class RemoteEntityTracker {
         }
 
         STREAMED.clear();
-        for (Map<RegistryKey<World>, IntSet> perPlayer : SENT.values()) {
-            for (IntSet ids : perPlayer.values()) {
-                STREAMED.addAll(ids);
+        for (Map<RegistryKey<World>, Int2ObjectMap<Motion>> perPlayer : SENT.values()) {
+            for (Int2ObjectMap<Motion> ids : perPlayer.values()) {
+                STREAMED.addAll(ids.keySet());
             }
         }
     }
@@ -121,9 +140,9 @@ public class RemoteEntityTracker {
 
         RegistryKey<World> dimension = world.getRegistryKey();
 
-        for (Map.Entry<UUID, Map<RegistryKey<World>, IntSet>> entry : SENT.entrySet()) {
-            IntSet ids = entry.getValue().get(dimension);
-            if (ids == null || !ids.contains(entity.getId())) {
+        for (Map.Entry<UUID, Map<RegistryKey<World>, Int2ObjectMap<Motion>>> entry : SENT.entrySet()) {
+            Int2ObjectMap<Motion> ids = entry.getValue().get(dimension);
+            if (ids == null || !ids.containsKey(entity.getId())) {
                 continue;
             }
 
@@ -139,7 +158,7 @@ public class RemoteEntityTracker {
     }
 
     /**
-     * Movement is sent absolutely by {@link #sync} every tick; vanilla's relative moves are deltas
+     * Movement is sent absolutely by {@link #sync}; vanilla's relative moves are deltas
      * against a baseline the remote client never had. Passenger and leash packets name a second
      * entity that may well not be streamed, and the client logs a warning for each one it cannot
      * resolve.
@@ -167,12 +186,12 @@ public class RemoteEntityTracker {
     }
 
     private static void sync(ServerPlayerEntity player, Map<RegistryKey<World>, List<Entity>> wanted) {
-        Map<RegistryKey<World>, IntSet> sent = SENT.computeIfAbsent(player.getUuid(), key -> new HashMap<>());
+        Map<RegistryKey<World>, Int2ObjectMap<Motion>> sent = SENT.computeIfAbsent(player.getUuid(), key -> new HashMap<>());
 
         // Retire anything that has walked out of range, died, or whose portal has closed. Done
         // first so an id can be retired and re-spawned in the same tick if it moved between pairs.
-        for (Map.Entry<RegistryKey<World>, IntSet> entry : sent.entrySet()) {
-            IntSet previously = entry.getValue();
+        for (Map.Entry<RegistryKey<World>, Int2ObjectMap<Motion>> entry : sent.entrySet()) {
+            Int2ObjectMap<Motion> previously = entry.getValue();
             if (previously.isEmpty()) {
                 continue;
             }
@@ -183,7 +202,7 @@ public class RemoteEntityTracker {
             }
 
             IntList gone = new IntArrayList();
-            previously.forEach((int id) -> {
+            previously.keySet().forEach((int id) -> {
                 if (!stillWanted.contains(id)) {
                     gone.add(id);
                 }
@@ -191,27 +210,32 @@ public class RemoteEntityTracker {
 
             if (!gone.isEmpty()) {
                 PacketRedirection.send(player, entry.getKey(), new EntitiesDestroyS2CPacket(gone));
-                previously.removeAll(gone);
+                previously.keySet().removeAll(gone);
             }
         }
 
         for (Map.Entry<RegistryKey<World>, List<Entity>> entry : wanted.entrySet()) {
             RegistryKey<World> dimension = entry.getKey();
-            IntSet previously = sent.computeIfAbsent(dimension, key -> new IntOpenHashSet());
+            Int2ObjectMap<Motion> previously = sent.computeIfAbsent(dimension, key -> new Int2ObjectOpenHashMap<>());
 
             for (Entity entity : entry.getValue()) {
-                if (previously.add(entity.getId())) {
+                Motion now = Motion.of(entity);
+                Motion before = previously.put(entity.getId(), now);
+
+                // The spawn carries the position and the head's facing with it.
+                if (before == null) {
                     spawn(player, dimension, entity);
-                } else {
+                    continue;
+                }
+
+                if (now.movedSince(before)) {
                     PacketRedirection.send(player, dimension, EntityPositionSyncS2CPacket.create(entity));
                 }
 
                 // The body's facing rides along with the position, but a head turns on its own,
                 // and a mob whose head is welded straight ahead reads as a statue.
-                if (entity instanceof LivingEntity living) {
-                    PacketRedirection.send(player, dimension, new EntitySetHeadYawS2CPacket(
-                            entity, (byte) MathHelper.floor(living.getHeadYaw() * 256.0F / 360.0F)
-                    ));
+                if (entity instanceof LivingEntity && now.headYaw() != before.headYaw()) {
+                    PacketRedirection.send(player, dimension, new EntitySetHeadYawS2CPacket(entity, now.headYaw()));
                 }
             }
         }
@@ -262,7 +286,7 @@ public class RemoteEntityTracker {
      * {@code destination}, entities included, so there is nothing to retire.
      */
     public static void onWorldChange(ServerPlayerEntity player, RegistryKey<World> destination) {
-        Map<RegistryKey<World>, IntSet> sent = SENT.get(player.getUuid());
+        Map<RegistryKey<World>, Int2ObjectMap<Motion>> sent = SENT.get(player.getUuid());
         if (sent != null) {
             sent.remove(destination);
         }

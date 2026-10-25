@@ -62,6 +62,8 @@ public class PacketRedirectionClient {
             return;
         }
 
+        SecondaryWorldManager.noteStreamed(payload.dimension());
+
         // Clock and weather are applied by hand rather than replayed through the network handler.
         // Its handlers do more than touch the world: the time packet also advances the telemetry
         // session, and a game-state packet can change the player's game mode or roll the credits.
