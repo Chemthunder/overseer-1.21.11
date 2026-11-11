@@ -28,11 +28,18 @@ vec3 rim;
 vec3 rimHot;
 const vec3 DEEP = vec3(0.012, 0.014, 0.026);
 
-// The far side is rendered full-screen from a virtual camera sharing this frame's projection and
-// screen alignment, so the correct texel for a point on the quad is the one at that point's own
-// screen position. A projective lookup, not a lookup by quad UV.
+// The far side is rendered from a virtual camera sharing this frame's projection and screen
+// alignment, so the correct texel for a point on the quad is the one at that point's own screen
+// position. A projective lookup, not a lookup by quad UV.
 vec2 screenUv() {
     return (clipPos.xy / clipPos.w) * 0.5 + 0.5;
+}
+
+// The view is not the whole screen, only the rectangle of it the doorway covers, rendered at the
+// screen's own resolution. TextureMat[0] says where that rectangle is: xy is its lower-left corner
+// in screen UV and zw is one over its size. This takes a screen position to a position in it.
+vec2 viewUv(vec2 screen) {
+    return (screen - TextureMat[0].xy) * TextureMat[0].zw;
 }
 
 float hash(vec2 p) {
@@ -172,7 +179,7 @@ void main() {
     // Passing through: the camera is beyond the doorway and the server has not caught up. The
     // far view fills the screen, plain, exactly as it will look once the crossing lands.
     if (tint.a < 0.9) {
-        fragColor = vec4(texture(PortalView, clamp(screenUv(), 0.0, 1.0)).rgb, 1.0);
+        fragColor = vec4(texture(PortalView, clamp(viewUv(screenUv()), 0.0, 1.0)).rgb, 1.0);
         return;
     }
 
@@ -215,11 +222,12 @@ void main() {
         noise(quadUv * 6.0 + vec2(31.7, -t * 0.8))
     ) - 0.5;
 
-    vec2 uv = screenUv() + ripple * 0.006 * nearEdge;
-    bool onScreen = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+    // The ripple is a distance on screen, so it is added before moving into the view's own space.
+    vec2 uv = viewUv(screenUv() + ripple * 0.006 * nearEdge);
+    bool inView = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
 
     // Blue carries how far the live view has faded in over the procedural one.
-    float live = onScreen ? tint.b : 0.0;
+    float live = inView ? tint.b : 0.0;
 
     vec3 color = proceduralVoid(quadUv);
     if (live > 0.0) {

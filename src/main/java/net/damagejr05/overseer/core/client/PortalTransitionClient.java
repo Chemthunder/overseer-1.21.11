@@ -18,14 +18,15 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 @Environment(EnvType.CLIENT)
 public class PortalTransitionClient {
     /** How long an armed transition stays valid, in milliseconds. */
-    private static final long TIMEOUT_MS = 5_000L;
+    static final long TIMEOUT_MS = 5_000L;
 
     private static long armedAt = Long.MIN_VALUE;
 
     public static void init() {
-        ClientPlayNetworking.registerGlobalReceiver(PortalTransitionPayload.ID, (payload, context) ->
-                arm()
-        );
+        ClientPlayNetworking.registerGlobalReceiver(PortalTransitionPayload.ID, (payload, context) -> {
+            arm();
+            CrossingContinuity.expect(payload.transform());
+        });
     }
 
     public static void arm() {
@@ -54,5 +55,6 @@ public class PortalTransitionClient {
 
     public static void clear() {
         armedAt = Long.MIN_VALUE;
+        CrossingContinuity.clear();
     }
 }

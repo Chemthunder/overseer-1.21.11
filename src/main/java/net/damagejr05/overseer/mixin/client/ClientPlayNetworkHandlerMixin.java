@@ -2,6 +2,7 @@ package net.damagejr05.overseer.mixin.client;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import net.damagejr05.overseer.core.client.CrossingContinuity;
 import net.damagejr05.overseer.core.client.PortalTransitionClient;
 import net.damagejr05.overseer.core.client.SecondaryWorldManager;
 import net.minecraft.client.MinecraftClient;
@@ -11,6 +12,7 @@ import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.render.WorldRenderer;
 import net.minecraft.client.world.ClientChunkLoadProgress;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.network.packet.s2c.play.PlayerRespawnS2CPacket;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.entry.RegistryEntry;
@@ -72,9 +74,43 @@ public class ClientPlayNetworkHandlerMixin {
         return adopted;
     }
 
+    // Every packet handler is entered twice: once on the network thread, where its first line
+    // reschedules it and throws, and once on the client thread, where it does its work. HEAD is
+    // ahead of that line, so anything injected there has to tell the two apart for itself. TAIL
+    // is only ever reached by the second.
+    @Inject(method = "onPlayerRespawn", at = @At("HEAD"))
+    private void overseer$rememberDepartingPlayer(PlayerRespawnS2CPacket packet, CallbackInfo ci) {
+        MinecraftClient client = MinecraftClient.getInstance();
+
+        if (client.isOnThread()) {
+            CrossingContinuity.beforeRespawn(client);
+        }
+    }
+
     @Inject(method = "onPlayerRespawn", at = @At("TAIL"))
     private void overseer$finishAdoption(PlayerRespawnS2CPacket packet, CallbackInfo ci) {
+        // Before the world just left is emptied: the player being carried from is one of the
+        // things in it.
+        CrossingContinuity.afterRespawn(MinecraftClient.getInstance());
         SecondaryWorldManager.finishAdoption();
+    }
+
+    /**
+     * The server's teleport for a crossing must not pull the player back to where the server
+     * last saw them. See {@link CrossingContinuity}.
+     */
+    @Inject(method = "onPlayerPositionLook", at = @At("HEAD"))
+    private void overseer$holdCarriedState(PlayerPositionLookS2CPacket packet, CallbackInfo ci) {
+        MinecraftClient client = MinecraftClient.getInstance();
+
+        if (client.isOnThread()) {
+            CrossingContinuity.beforeTeleport(client, packet);
+        }
+    }
+
+    @Inject(method = "onPlayerPositionLook", at = @At("TAIL"))
+    private void overseer$restoreCarriedState(PlayerPositionLookS2CPacket packet, CallbackInfo ci) {
+        CrossingContinuity.afterTeleport(MinecraftClient.getInstance());
     }
 
     @Redirect(

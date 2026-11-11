@@ -9,6 +9,7 @@ import net.damagejr05.overseer.core.portal.PortalTransform;
 import net.damagejr05.overseer.core.net.PortalTransitionPayload;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -127,7 +128,6 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
         }
 
         Vec3d exitCentre = transform.applyPoint(current);
-        Vec3d exitVelocity = transform.applyVector(player.getVelocity());
 
         // samplePos() works from the body centre, so undo that offset to get a feet position.
         Vec3d exitFeet = exitCentre.subtract(0, player.getHeight() / 2.0, 0);
@@ -142,20 +142,24 @@ public class PortalComponent implements AutoSyncedComponent, CommonTickingCompon
         // teleports in place, nothing consumes the flag, and it would then swallow the loading
         // screen of whatever unrelated dimension change came next.
         if (player instanceof ServerPlayerEntity serverPlayer && destination != player.getEntityWorld()) {
-            ServerPlayNetworking.send(serverPlayer, PortalTransitionPayload.INSTANCE);
+            ServerPlayNetworking.send(serverPlayer, new PortalTransitionPayload(transform));
         }
 
+        // Facing and velocity are sent as a turn, not as values -- the way vanilla's own nether
+        // portal does it. A player's look direction and momentum live on their client, and what
+        // the server holds is a round trip stale: sending its copy back as absolutes snapped the
+        // view to wherever the mouse had been a moment ago and stopped the player dead, in the
+        // middle of every crossing. Told only how far to turn, the client turns what it has.
         player.teleportTo(new TeleportTarget(
                 destination,
                 exitFeet,
-                exitVelocity,
-                transform.applyYaw(player.getYaw()),
-                player.getPitch(),
+                Vec3d.ZERO,
+                transform.yawDelta(),
+                0.0F,
+                PositionFlag.combine(PositionFlag.DELTA, PositionFlag.ROT),
                 TeleportTarget.NO_OP
         ));
 
-        // Carry momentum across the seam; teleportTo alone does not preserve fall distance state.
-        player.setVelocity(exitVelocity);
         player.fallDistance = 0.0;
 
         // The swept segment must not span the teleport, or the next tick would look like a huge

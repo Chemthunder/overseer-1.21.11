@@ -133,6 +133,25 @@ public class PortalViewCompositor {
         WorldRenderEvents.BEFORE_TRANSLUCENT.register(PortalViewCompositor::render);
     }
 
+    /**
+     * The offscreen view has been released, so there is no last frame left to fade out from.
+     * Anything still part-way through a fade would otherwise go on sampling a texture that has
+     * since been replaced by an empty placeholder.
+     */
+    static void onViewReleased() {
+        fadeAnchor = null;
+        fade = 0.0F;
+    }
+
+    /** Forget the session that has just ended. */
+    public static void reset() {
+        SEEN_WITHOUT_VIEW.clear();
+        fadeAnchor = null;
+        fade = 0.0F;
+        lastFrameNanos = 0L;
+        sealed = 0.0F;
+    }
+
     private static ShaderMaterial material() {
         if (material == null) {
             material = ShaderMaterial.builder(Overseer.id("portal_view"))
@@ -166,10 +185,13 @@ public class PortalViewCompositor {
         PortalAnchor seeThrough = PortalViewRenderer.renderedEntry();
 
         // The sampler must be bound to something valid even when there is no live view, so make
-        // sure the target exists before drawing.
+        // sure the target exists before drawing. A placeholder is enough: nothing reads it until
+        // a view has been rendered, and rendering one resizes it to whatever that view needs.
+        // This used to allocate the full size of the screen, colour and depth, for a doorway
+        // that might never show anything but the procedural aperture.
         MinecraftClient mc = MinecraftClient.getInstance();
         if (!target.isPrepared()) {
-            target.prepare(mc.getFramebuffer().textureWidth, mc.getFramebuffer().textureHeight);
+            target.prepare(PortalViewRenderer.PLACEHOLDER_SIZE, PortalViewRenderer.PLACEHOLDER_SIZE);
         }
 
         ShaderMaterial mat = material();
@@ -198,9 +220,26 @@ public class PortalViewCompositor {
         boolean through = PortalViewRenderer.isThrough();
         DoorwayComponent doorways = DoorwayComponent.get(client.world);
 
+        // The doorway the camera is still coming out of keeps its frame and loses its surface;
+        // see PortalViewRenderer.isEmerging. Asked once, so the count and the geometry agree.
+        PortalAnchor emerging = null;
+
         int quads = through ? 1 : 0;
         for (PortalAnchor portal : portals) {
-            quads += doorways.isEvictionAnchor(portal) ? 1 : FACES;
+            boolean open = PortalViewRenderer.isEmerging(portal);
+            if (open) {
+                emerging = portal;
+            }
+
+            if (doorways.isEvictionAnchor(portal)) {
+                quads += open ? 0 : 1;
+            } else {
+                quads += open ? FACES - 1 : FACES;
+            }
+        }
+
+        if (quads == 0) {
+            return;
         }
 
         // The eviction's portal opens inside the eye's pupil, and is whatever size that is.
@@ -231,12 +270,17 @@ public class PortalViewCompositor {
                     SEEN_WITHOUT_VIEW.add(portal);
                 }
 
+                boolean open = portal.equals(emerging);
+
                 if (doorways.isEvictionAnchor(portal)) {
-                    emitRound(builder, portal, camera, view, skyScale);
+                    // Frameless, so with no surface there is nothing left of it to draw.
+                    if (!open) {
+                        emitRound(builder, portal, camera, view, skyScale);
+                    }
                     continue;
                 }
 
-                emitPortal(builder, portal, camera, view, isDynamic ? easeOutBack(opening) : 1.0F);
+                emitPortal(builder, portal, camera, view, isDynamic ? easeOutBack(opening) : 1.0F, !open);
             }
 
             // Last, and nearer than anything else, so it covers the doorway it is passing through.
@@ -298,7 +342,8 @@ public class PortalViewCompositor {
      * <p>Everything is camera-relative, matching the space world geometry is drawn in. Culling is
      * off for this material, so winding does not matter.
      */
-    private static void emitPortal(BufferBuilder builder, PortalAnchor entry, Vec3d camera, float viewFlag, float scale) {
+    private static void emitPortal(BufferBuilder builder, PortalAnchor entry, Vec3d camera, float viewFlag,
+                                   float scale, boolean surface) {
         // Never quite zero: a degenerate quad is harmless, but its UVs feed a division.
         scale = Math.max(scale, 0.001F);
 
@@ -309,8 +354,11 @@ public class PortalViewCompositor {
         Vec3d right = entry.right();
         Vec3d out = entry.normal();
 
-        // The view surface, on the anchor plane, at the narrow end of the splay.
-        Vec3d[] view = ring(centre, right, halfWidth, halfHeight, SPLAY_INSET * scale, Vec3d.ZERO);
+        // The view surface, at the narrow end of the splay. On the anchor plane, except when the
+        // camera is about to pass through it: then it backs away, so that the near plane never
+        // gets the chance to cut a hole in it. See PortalGeometry.
+        Vec3d[] view = ring(centre, right, halfWidth, halfHeight, SPLAY_INSET * scale,
+                out.multiply(PortalGeometry.retreat(entry, camera)));
 
         // UVs in blocks from the surface's own centre. The shader measures its rim and edge
         // shading in blocks, so they keep the same thickness whatever size the opening is, and it
@@ -318,10 +366,12 @@ public class PortalViewCompositor {
         float u = (float) (halfWidth - SPLAY_INSET * scale);
         float v = (float) (halfHeight - SPLAY_INSET * scale / 2.0);
 
-        aperture(builder, view[0], -u, -v, viewFlag);
-        aperture(builder, view[1], u, -v, viewFlag);
-        aperture(builder, view[2], u, v, viewFlag);
-        aperture(builder, view[3], -u, v, viewFlag);
+        if (surface) {
+            aperture(builder, view[0], -u, -v, viewFlag);
+            aperture(builder, view[1], u, -v, viewFlag);
+            aperture(builder, view[2], u, v, viewFlag);
+            aperture(builder, view[3], -u, v, viewFlag);
+        }
 
         // A recess out to each face of the block. Both are emitted every frame and the depth test
         // picks: the aperture is opaque and spans the whole opening, so the recess on the far side
@@ -507,12 +557,18 @@ public class PortalViewCompositor {
             modelView = new Matrix4f();
         }
 
+        // The offscreen view covers only the part of the screen its doorway does. The texture
+        // matrix is unused by this shader as a matrix, so its first column carries where that
+        // part is: the corner in screen UV, then one over the size.
+        Vector4f rect = PortalViewRenderer.viewRect();
+        Matrix4f viewRect = new Matrix4f().m00(rect.x).m01(rect.y).m02(rect.z).m03(rect.w);
+
         // The colour modulator is unused by this shader as a colour, so it carries the seal.
         GpuBufferSlice transforms = RenderSystem.getDynamicUniforms().write(
                 modelView,
                 new Vector4f(sealed, 0.0F, 0.0F, 1.0F),
                 new Vector3f(),
-                new Matrix4f()
+                viewRect
         );
 
         try (RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(

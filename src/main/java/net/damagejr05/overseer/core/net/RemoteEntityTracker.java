@@ -1,7 +1,10 @@
 package net.damagejr05.overseer.core.net;
 
 import com.mojang.datafixers.util.Pair;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntIterator;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.ints.IntSet;
@@ -47,10 +50,16 @@ import java.util.UUID;
  * the blocks, this one sends everything that moves.
  *
  * <p>This is a deliberately simple tracker rather than a second copy of vanilla's
- * {@code EntityTrackerEntry}. It re-sends an absolute position for every visible entity every
- * tick instead of maintaining delta state, because the set it covers is small and bounded -- one
- * sphere around one anchor -- and a portal view is only ever a few dozen blocks deep. Correctness
- * under teleports, vehicles and rubber-banding comes for free when nothing is incremental.
+ * {@code EntityTrackerEntry}. Positions are always sent absolutely, never as a delta against the
+ * last one, because the set it covers is small and bounded -- one sphere around one anchor -- and
+ * a portal view is only ever a few dozen blocks deep. Correctness under teleports, vehicles and
+ * rubber-banding comes for free when nothing is incremental.
+ *
+ * <p>Absolute does not have to mean every tick, though. It did once, and nearly all of it was
+ * wasted: of the things standing beyond a doorway -- item frames, armour stands, dropped items,
+ * animals that have stopped to graze -- most are not moving at any given moment, and each was
+ * costing two packets a tick per viewer to say so. A position now goes out when it has changed,
+ * and otherwise only often enough to mend a client that has drifted.
  *
  * <p>Everything that is <em>not</em> movement -- tracked data, equipment, attributes, swings, hurt
  * and death animations -- is not re-derived here at all. Vanilla's own tracker already works out
@@ -72,7 +81,51 @@ public class RemoteEntityTracker {
      * are frequently in the same place in their own coordinate spaces, and a flat key would let
      * one dimension's bookkeeping mask the other's.
      */
-    private static final Map<UUID, Map<RegistryKey<World>, IntSet>> SENT = new HashMap<>();
+    private static final Map<UUID, Map<RegistryKey<World>, Int2ObjectMap<Sent>>> SENT = new HashMap<>();
+
+    /**
+     * How long an entity that has not moved goes without its position being repeated, in ticks.
+     * The client only ever moves a streamed entity toward what it was last told, so there is
+     * little that can go wrong; this is what puts right the little that can.
+     */
+    private static final int REFRESH_TICKS = 100;
+
+    /** What one player was last told about where one entity is. */
+    private static final class Sent {
+        private double x, y, z;
+        private float yaw, pitch;
+        private boolean onGround;
+        private byte headYaw;
+        private int positionTick;
+
+        /** Record the entity's position, and say whether that was news. */
+        boolean movedSince(Entity entity, int tick) {
+            if (entity.getX() == x && entity.getY() == y && entity.getZ() == z
+                    && entity.getYaw() == yaw && entity.getPitch() == pitch
+                    && entity.isOnGround() == onGround
+                    && tick - positionTick < REFRESH_TICKS) {
+                return false;
+            }
+
+            x = entity.getX();
+            y = entity.getY();
+            z = entity.getZ();
+            yaw = entity.getYaw();
+            pitch = entity.getPitch();
+            onGround = entity.isOnGround();
+            positionTick = tick;
+            return true;
+        }
+
+        boolean headTurnedSince(byte packed) {
+            if (packed == headYaw) {
+                return false;
+            }
+
+            headYaw = packed;
+            return true;
+        }
+    }
 
     /**
      * Every id streamed to anyone, rebuilt each tick.
@@ -95,13 +148,13 @@ public class RemoteEntityTracker {
                 collect(server, player, streamed.to(), wanted);
             }
 
-            sync(player, wanted);
+            sync(player, wanted, server.getTicks());
         }
 
         STREAMED.clear();
-        for (Map<RegistryKey<World>, IntSet> perPlayer : SENT.values()) {
-            for (IntSet ids : perPlayer.values()) {
-                STREAMED.addAll(ids);
+        for (Map<RegistryKey<World>, Int2ObjectMap<Sent>> perPlayer : SENT.values()) {
+            for (Int2ObjectMap<Sent> entities : perPlayer.values()) {
+                STREAMED.addAll(entities.keySet());
             }
         }
     }
@@ -121,9 +174,9 @@ public class RemoteEntityTracker {
 
         RegistryKey<World> dimension = world.getRegistryKey();
 
-        for (Map.Entry<UUID, Map<RegistryKey<World>, IntSet>> entry : SENT.entrySet()) {
-            IntSet ids = entry.getValue().get(dimension);
-            if (ids == null || !ids.contains(entity.getId())) {
+        for (Map.Entry<UUID, Map<RegistryKey<World>, Int2ObjectMap<Sent>>> entry : SENT.entrySet()) {
+            Int2ObjectMap<Sent> entities = entry.getValue().get(dimension);
+            if (entities == null || !entities.containsKey(entity.getId())) {
                 continue;
             }
 
@@ -139,7 +192,7 @@ public class RemoteEntityTracker {
     }
 
     /**
-     * Movement is sent absolutely by {@link #sync} every tick; vanilla's relative moves are deltas
+     * Movement is sent absolutely by {@link #sync} as it happens; vanilla's relative moves are deltas
      * against a baseline the remote client never had. Passenger and leash packets name a second
      * entity that may well not be streamed, and the client logs a warning for each one it cannot
      * resolve.
@@ -166,13 +219,23 @@ public class RemoteEntityTracker {
                 .addAll(world.getOtherEntities(null, box, entity -> !entity.isRemoved() && entity != player));
     }
 
-    private static void sync(ServerPlayerEntity player, Map<RegistryKey<World>, List<Entity>> wanted) {
-        Map<RegistryKey<World>, IntSet> sent = SENT.computeIfAbsent(player.getUuid(), key -> new HashMap<>());
+    private static void sync(ServerPlayerEntity player, Map<RegistryKey<World>, List<Entity>> wanted, int tick) {
+        Map<RegistryKey<World>, Int2ObjectMap<Sent>> sent = SENT.get(player.getUuid());
+
+        // Nowhere near a doorway and never has been: nothing to retire and nothing to send.
+        if (sent == null) {
+            if (wanted.isEmpty()) {
+                return;
+            }
+
+            sent = new HashMap<>();
+            SENT.put(player.getUuid(), sent);
+        }
 
         // Retire anything that has walked out of range, died, or whose portal has closed. Done
         // first so an id can be retired and re-spawned in the same tick if it moved between pairs.
-        for (Map.Entry<RegistryKey<World>, IntSet> entry : sent.entrySet()) {
-            IntSet previously = entry.getValue();
+        for (Map.Entry<RegistryKey<World>, Int2ObjectMap<Sent>> entry : sent.entrySet()) {
+            Int2ObjectMap<Sent> previously = entry.getValue();
             if (previously.isEmpty()) {
                 continue;
             }
@@ -183,35 +246,45 @@ public class RemoteEntityTracker {
             }
 
             IntList gone = new IntArrayList();
-            previously.forEach((int id) -> {
+            for (IntIterator ids = previously.keySet().iterator(); ids.hasNext(); ) {
+                int id = ids.nextInt();
+
                 if (!stillWanted.contains(id)) {
                     gone.add(id);
+                    ids.remove();
                 }
-            });
+            }
 
             if (!gone.isEmpty()) {
                 PacketRedirection.send(player, entry.getKey(), new EntitiesDestroyS2CPacket(gone));
-                previously.removeAll(gone);
             }
         }
 
         for (Map.Entry<RegistryKey<World>, List<Entity>> entry : wanted.entrySet()) {
             RegistryKey<World> dimension = entry.getKey();
-            IntSet previously = sent.computeIfAbsent(dimension, key -> new IntOpenHashSet());
+            Int2ObjectMap<Sent> previously = sent.computeIfAbsent(dimension, key -> new Int2ObjectOpenHashMap<>());
 
             for (Entity entity : entry.getValue()) {
-                if (previously.add(entity.getId())) {
+                Sent state = previously.get(entity.getId());
+
+                if (state == null) {
+                    state = new Sent();
+                    state.movedSince(entity, tick);
+                    previously.put(entity.getId(), state);
+
                     spawn(player, dimension, entity);
-                } else {
+                } else if (state.movedSince(entity, tick)) {
                     PacketRedirection.send(player, dimension, EntityPositionSyncS2CPacket.create(entity));
                 }
 
                 // The body's facing rides along with the position, but a head turns on its own,
                 // and a mob whose head is welded straight ahead reads as a statue.
                 if (entity instanceof LivingEntity living) {
-                    PacketRedirection.send(player, dimension, new EntitySetHeadYawS2CPacket(
-                            entity, (byte) MathHelper.floor(living.getHeadYaw() * 256.0F / 360.0F)
-                    ));
+                    byte headYaw = (byte) MathHelper.floor(living.getHeadYaw() * 256.0F / 360.0F);
+
+                    if (state.headTurnedSince(headYaw)) {
+                        PacketRedirection.send(player, dimension, new EntitySetHeadYawS2CPacket(entity, headYaw));
+                    }
                 }
             }
         }
@@ -262,7 +335,7 @@ public class RemoteEntityTracker {
      * {@code destination}, entities included, so there is nothing to retire.
      */
     public static void onWorldChange(ServerPlayerEntity player, RegistryKey<World> destination) {
-        Map<RegistryKey<World>, IntSet> sent = SENT.get(player.getUuid());
+        Map<RegistryKey<World>, Int2ObjectMap<Sent>> sent = SENT.get(player.getUuid());
         if (sent != null) {
             sent.remove(destination);
         }

@@ -29,9 +29,15 @@ import net.minecraft.world.dimension.DimensionType;
 import net.minecraft.world.dimension.DimensionTypes;
 import org.jetbrains.annotations.Nullable;
 
+import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongList;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
+
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -53,6 +59,18 @@ public class SecondaryWorldManager {
     private static final Map<RegistryKey<World>, WorldRenderer> RENDERERS = new HashMap<>();
     private static final Map<RegistryKey<World>, RenderDispatcher> DISPATCHERS = new HashMap<>();
     private static final Map<RegistryKey<World>, WorldRenderState> RENDER_STATES = new HashMap<>();
+
+    /**
+     * The buffer storage of every renderer built here that is still alive.
+     *
+     * <p>Keyed by the renderer rather than by dimension: a renderer changes which dimension it
+     * belongs to every time the player steps through, and may be the client's main renderer and
+     * so in none of the maps above. Its buffers stay its own throughout.
+     */
+    private static final Map<WorldRenderer, RendererBuffers> OWNED_BUFFERS = new IdentityHashMap<>();
+
+    /** Buffers of renderers that have been closed, waiting until it is safe to free them. */
+    private static final List<RendererBuffers> RETIRED_BUFFERS = new ArrayList<>();
 
     /**
      * Vanilla never tells the client which dimension type backs which dimension, so the mapping is
@@ -194,6 +212,10 @@ public class SecondaryWorldManager {
             return null;
         }
 
+        RendererBuffers owned = null;
+        RenderDispatcher dispatcher = null;
+        WorldRenderer renderer = null;
+
         try {
             // Everything per-frame and mutable is its own. Sharing any of these would have two
             // renderers writing the same buffers within one frame, which corrupts both.
@@ -208,8 +230,9 @@ public class SecondaryWorldManager {
             BufferBuilderStorage buffers = new BufferBuilderStorage(
                     Runtime.getRuntime().availableProcessors()
             );
+            owned = new RendererBuffers(buffers);
 
-            RenderDispatcher dispatcher = new RenderDispatcher(
+            dispatcher = new RenderDispatcher(
                     new OrderedRenderCommandQueueImpl(),
                     client.getBlockRenderManager(),
                     buffers.getEntityVertexConsumers(),
@@ -221,7 +244,7 @@ public class SecondaryWorldManager {
 
             WorldRenderState renderState = new WorldRenderState();
 
-            WorldRenderer renderer = new WorldRenderer(
+            renderer = new WorldRenderer(
                     client,
                     client.getEntityRenderDispatcher(),
                     client.getBlockEntityRenderDispatcher(),
@@ -229,9 +252,6 @@ public class SecondaryWorldManager {
                     renderState,
                     dispatcher
             );
-
-            DISPATCHERS.put(dimension, dispatcher);
-            RENDER_STATES.put(dimension, renderState);
 
             ClientWorld.Properties properties = new ClientWorld.Properties(
                     primary.getLevelProperties().getDifficulty(),
@@ -268,6 +288,9 @@ public class SecondaryWorldManager {
 
             WORLDS.put(dimension, world);
             RENDERERS.put(dimension, renderer);
+            DISPATCHERS.put(dimension, dispatcher);
+            RENDER_STATES.put(dimension, renderState);
+            OWNED_BUFFERS.put(renderer, owned);
 
             // The clock starts at zero and the server's first sync is up to a second away. The
             // player's own world is a far better guess than tick zero in the meantime: every
@@ -278,7 +301,52 @@ public class SecondaryWorldManager {
             return world;
         } catch (Exception e) {
             Overseer.LOGGER.error("Failed to create secondary client world {}", dimension.getValue(), e);
+
+            // Whatever was built before it failed still holds memory and GPU objects, and
+            // nothing else has a reference to any of it.
+            abandon(renderer, dispatcher, owned);
             return null;
+        }
+    }
+
+    /** Release the pieces of a secondary world that never finished being put together. */
+    private static void abandon(@Nullable WorldRenderer renderer, @Nullable RenderDispatcher dispatcher,
+                                @Nullable RendererBuffers owned) {
+        try {
+            if (renderer != null) {
+                renderer.setWorld(null);
+                renderer.close();
+            }
+
+            if (dispatcher != null) {
+                dispatcher.close();
+            }
+        } catch (Throwable e) {
+            Overseer.LOGGER.error("Failed to clean up a half-built secondary world", e);
+        }
+
+        if (owned != null) {
+            RETIRED_BUFFERS.add(owned);
+        }
+    }
+
+    /**
+     * Close a renderer built here and queue its buffers for release. Vanilla's own renderer is
+     * only ever set aside, never closed: it is registered as a resource reloader and goes back
+     * into service on disconnect.
+     */
+    private static void closeRenderer(WorldRenderer renderer) {
+        renderer.setWorld(null);
+
+        if (renderer == vanillaRenderer) {
+            return;
+        }
+
+        renderer.close();
+
+        RendererBuffers owned = OWNED_BUFFERS.remove(renderer);
+        if (owned != null) {
+            RETIRED_BUFFERS.add(owned);
         }
     }
 
@@ -359,8 +427,13 @@ public class SecondaryWorldManager {
             }
         }
 
+        sweepLeftovers();
         maintainRenderers(client);
         disposeEmptyWorlds();
+
+        if (!RETIRED_BUFFERS.isEmpty()) {
+            RETIRED_BUFFERS.removeIf(RendererBuffers::tickRetired);
+        }
 
         for (ClientWorld world : WORLDS.values()) {
             if (world == client.world) {
@@ -456,6 +529,94 @@ public class SecondaryWorldManager {
     /** Spread over ticks: a whole view distance of unloads in one frame is a visible hitch. */
     private static final int TRIM_PER_TICK = 48;
 
+    /**
+     * The chunks of each secondary world that the server's stream has sent and not taken back.
+     *
+     * <p>These are the only chunks the server will ever unload again, which is why they have to
+     * be told apart from the rest. A world that was the player's own a moment ago is full of
+     * chunks the stream never sent; the ones near a doorway are kept so that looking back shows
+     * something at once, and the stream then sends its own copies over the top of most of them.
+     * Most, not all -- it covers a smaller area, around one doorway -- and the remainder used to
+     * sit there for good: never updated, never unloaded, and enough on their own to stop the
+     * world ever counting as empty. After one trip through a doorway and back, that dimension's
+     * world, renderer and buffers stayed loaded and ticking for the rest of the session however
+     * far away the player went.
+     */
+    private static final Map<RegistryKey<World>, LongSet> STREAMED = new HashMap<>();
+
+    /** Chunks kept near a doorway in the dimension just left, to be looked at again shortly. */
+    private static final LongList LEFTOVER = new LongArrayList();
+    private static @Nullable RegistryKey<World> leftoverDimension = null;
+    private static int leftoverTicks = 0;
+
+    /**
+     * How long the stream is given to send its own copy of what was kept, in ticks. It needs
+     * about one second; anything still unclaimed after five is not going to be.
+     */
+    private static final int LEFTOVER_SETTLE_TICKS = 100;
+
+    /** The stream has sent a chunk of a secondary world. */
+    public static void onStreamedChunk(RegistryKey<World> dimension, int chunkX, int chunkZ) {
+        STREAMED.computeIfAbsent(dimension, key -> new LongOpenHashSet()).add(ChunkPos.toLong(chunkX, chunkZ));
+    }
+
+    /** The stream has taken a chunk of a secondary world back. */
+    public static void onStreamedUnload(RegistryKey<World> dimension, ChunkPos pos) {
+        LongSet streamed = STREAMED.get(dimension);
+        if (streamed != null) {
+            streamed.remove(pos.toLong());
+        }
+    }
+
+    /** Stop tracking a dimension that is no longer a secondary world. */
+    private static void forgetStream(RegistryKey<World> dimension) {
+        STREAMED.remove(dimension);
+
+        if (dimension == leftoverDimension) {
+            leftoverDimension = null;
+            LEFTOVER.clear();
+        }
+    }
+
+    /**
+     * Once the stream has had time to claim what it is going to, unload whatever it did not.
+     * From then on the world holds exactly what the server is keeping current, and empties --
+     * and is dropped -- when the server stops.
+     */
+    private static void sweepLeftovers() {
+        if (leftoverDimension == null || --leftoverTicks > 0) {
+            return;
+        }
+
+        RegistryKey<World> dimension = leftoverDimension;
+        leftoverDimension = null;
+
+        ClientWorld world = WORLDS.get(dimension);
+        if (world != null) {
+            LongSet streamed = STREAMED.get(dimension);
+
+            if (trimDimension != dimension) {
+                TRIM.clear();
+                trimDimension = dimension;
+            }
+
+            for (int i = 0; i < LEFTOVER.size(); i++) {
+                long key = LEFTOVER.getLong(i);
+
+                if (streamed != null && streamed.contains(key)) {
+                    continue;
+                }
+
+                ChunkPos pos = new ChunkPos(key);
+                if (world.getChunkManager().getWorldChunk(pos.x, pos.z) != null) {
+                    TRIM.add(pos);
+                }
+            }
+        }
+
+        LEFTOVER.clear();
+    }
+
     /** Matches the radius the server streams, with a ring to spare. */
     private static final int KEEP_RADIUS = 5;
 
@@ -509,6 +670,8 @@ public class SecondaryWorldManager {
         EMPTY_TICKS.remove(dimension);
         PacketRedirectionClient.forget(dimension);
         PortalViewRenderer.forget(dimension);
+        forgetStream(dimension);
+        forgetStream(outgoingDimension);
 
         WORLDS.put(outgoingDimension, outgoing);
         RENDERERS.put(outgoingDimension, client.worldRenderer);
@@ -584,13 +747,24 @@ public class SecondaryWorldManager {
         TRIM.clear();
         trimDimension = dimension;
 
+        LEFTOVER.clear();
+        leftoverDimension = dimension;
+        leftoverTicks = LEFTOVER_SETTLE_TICKS;
+
         // The camera has not moved yet -- the new position arrives with the next packet -- so it
         // still marks the middle of what the departed world has loaded.
         for (int x = -reach; x <= reach; x++) {
             for (int z = -reach; z <= reach; z++) {
                 ChunkPos pos = new ChunkPos(centre.x + x, centre.z + z);
 
-                if (world.getChunkManager().getWorldChunk(pos.x, pos.z) != null && !nearAnchor(pos, anchors)) {
+                if (world.getChunkManager().getWorldChunk(pos.x, pos.z) == null) {
+                    continue;
+                }
+
+                if (nearAnchor(pos, anchors)) {
+                    // Kept for now. Whether it stays is the stream's decision; see STREAMED.
+                    LEFTOVER.add(pos.toLong());
+                } else {
                     TRIM.add(pos);
                 }
             }
@@ -691,18 +865,13 @@ public class SecondaryWorldManager {
 
         WorldRenderer renderer = RENDERERS.remove(dimension);
         if (renderer != null && renderer != client.worldRenderer) {
-            renderer.setWorld(null);
-
-            // Vanilla's own renderer is only ever set aside, never closed: it is registered as a
-            // resource reloader and goes back into service on disconnect.
-            if (renderer != vanillaRenderer) {
-                renderer.close();
-            }
+            closeRenderer(renderer);
         }
 
         RENDER_STATES.remove(dimension);
         EMPTY_TICKS.remove(dimension);
         PortalViewRenderer.forget(dimension);
+        forgetStream(dimension);
 
         if (dimension == trimDimension) {
             TRIM.clear();
@@ -726,11 +895,7 @@ public class SecondaryWorldManager {
 
         for (WorldRenderer renderer : RENDERERS.values()) {
             if (renderer != client.worldRenderer) {
-                renderer.setWorld(null);
-
-                if (renderer != vanillaRenderer) {
-                    renderer.close();
-                }
+                closeRenderer(renderer);
             }
         }
 
@@ -747,8 +912,7 @@ public class SecondaryWorldManager {
             client.worldRenderer = vanillaRenderer;
             client.gameRenderer.worldRenderState = vanillaState;
 
-            standIn.setWorld(null);
-            standIn.close();
+            closeRenderer(standIn);
 
             if (primaryDispatcher != null) {
                 primaryDispatcher.close();
@@ -760,6 +924,9 @@ public class SecondaryWorldManager {
         departed = null;
         TRIM.clear();
         trimDimension = null;
+        STREAMED.clear();
+        LEFTOVER.clear();
+        leftoverDimension = null;
 
         PacketRedirectionClient.clear();
 

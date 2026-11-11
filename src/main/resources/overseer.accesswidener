@@ -58,3 +58,20 @@ accessible field net/minecraft/client/network/ClientPlayNetworkHandler worldProp
 # to be made directly, or the dimension it draws has no clouds.
 accessible method net/minecraft/client/render/CloudRenderer prepare (Lnet/minecraft/resource/ResourceManager;Lnet/minecraft/util/profiler/Profiler;)Ljava/util/Optional;
 accessible method net/minecraft/client/render/CloudRenderer apply (Ljava/util/Optional;Lnet/minecraft/resource/ResourceManager;Lnet/minecraft/util/profiler/Profiler;)V
+
+# Stepping through a doorway replaces the client's player entity, and the new one starts with its
+# presentation state at zero: the walk bob stops mid-stride and the held item drops out of view as
+# though it had just been swung. All of it is carried over from the player being replaced.
+accessible field net/minecraft/client/network/ClientPlayerLikeState distanceMoved F
+accessible field net/minecraft/client/network/ClientPlayerLikeState lastDistanceMoved F
+accessible field net/minecraft/client/network/ClientPlayerLikeState movement F
+accessible field net/minecraft/client/network/ClientPlayerLikeState lastMovement F
+accessible field net/minecraft/entity/LivingEntity ticksSinceLastAttack I
+accessible field net/minecraft/entity/LivingEntity ticksSinceHandEquipping I
+
+# A world renderer built here needs a buffer storage of its own, and that holds tens of megabytes
+# of memory the garbage collector cannot see. Vanilla makes exactly one and keeps it for the life
+# of the process, so nothing in it has a way to be released; these are what has to be closed.
+accessible field net/minecraft/client/render/VertexConsumerProvider$Immediate allocator Lnet/minecraft/client/util/BufferAllocator;
+accessible field net/minecraft/client/render/VertexConsumerProvider$Immediate layerBuffers Ljava/util/SequencedMap;
+accessible field net/minecraft/client/render/OutlineVertexConsumerProvider plainDrawer Lnet/minecraft/client/render/VertexConsumerProvider$Immediate;

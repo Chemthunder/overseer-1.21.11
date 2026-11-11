@@ -17,12 +17,16 @@ import net.minecraft.world.World;
 import net.minecraft.world.chunk.WorldChunk;
 import org.jetbrains.annotations.Nullable;
 
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
+
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -47,11 +51,35 @@ public class RemoteChunkTracker {
     private static final double ACTIVATION_DISTANCE = 48.0;
 
     /**
-     * A full second here was visible: step through and the doorway behind you showed the void
-     * until the next pass came round. The pass itself is a set difference over a few dozen
-     * entries, so there is no reason to make anyone wait for it.
+     * The most chunks sent to one player in one tick.
+     *
+     * <p>The far side used to go out all at once: eighty-one chunks in a single tick, the moment
+     * a player came within range of a doorway or stepped through one. The server had to serialise
+     * all of them in that tick, and the client then had to unpack, light and queue for meshing
+     * all of them in one frame -- a freeze of a few hundred milliseconds on a slow machine, timed
+     * for exactly the moment of walking through.
+     *
+     * <p>A few per tick, nearest the doorway first, spreads the same work over about a second.
+     * What can be seen through the opening is overwhelmingly the chunks right behind it, and
+     * those still arrive within the first couple of ticks.
      */
-    private static final int INTERVAL_TICKS = 5;
+    private static final int CHUNKS_PER_TICK = 4;
+
+    /** Every offset within {@link #RADIUS} of the centre, nearest first. */
+    private static final int[][] NEAREST_FIRST = nearestFirst();
+
+    private static int[][] nearestFirst() {
+        List<int[]> offsets = new ArrayList<>();
+
+        for (int x = -RADIUS; x <= RADIUS; x++) {
+            for (int z = -RADIUS; z <= RADIUS; z++) {
+                offsets.add(new int[]{x, z});
+            }
+        }
+
+        offsets.sort(Comparator.comparingInt(offset -> offset[0] * offset[0] + offset[1] * offset[1]));
+        return offsets.toArray(new int[0][]);
+    }
 
     /**
      * Chunks currently sent to each player, per dimension.
@@ -61,26 +89,14 @@ public class RemoteChunkTracker {
      * and a collision makes the tracker believe a chunk it sent for one world already covers the
      * other, so it silently streams nothing.
      */
-    private static final Map<UUID, Map<RegistryKey<World>, Set<Long>>> SENT = new HashMap<>();
-
-    private static int counter = 0;
+    private static final Map<UUID, Map<RegistryKey<World>, LongSet>> SENT = new HashMap<>();
 
     public static void tick(MinecraftServer server) {
-        if (counter++ % INTERVAL_TICKS != 0) {
-            return;
-        }
-
         DoorwayComponent doorways = DoorwayComponent.get(server);
 
         for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            Map<RegistryKey<World>, Set<Long>> wanted = new HashMap<>();
-
             PortalTransform streamed = streamed(player, doorways);
-            if (streamed != null) {
-                collect(streamed.to(), wanted);
-            }
-
-            sync(server, player, wanted);
+            sync(server, player, streamed == null ? null : streamed.to());
         }
     }
 
@@ -130,30 +146,40 @@ public class RemoteChunkTracker {
         return best;
     }
 
-    private static void collect(PortalAnchor far, Map<RegistryKey<World>, Set<Long>> wanted) {
-        ChunkPos centre = new ChunkPos(BlockPos.ofFloored(far.center()));
+    /**
+     * Bring what one player holds into line with the area around {@code far}, or with nothing.
+     *
+     * <p>Runs every tick, so the common case has to cost nothing: a player nowhere near a doorway
+     * who has never been sent a chunk leaves on the first line.
+     */
+    private static void sync(MinecraftServer server, ServerPlayerEntity player, @Nullable PortalAnchor far) {
+        Map<RegistryKey<World>, LongSet> sent = SENT.get(player.getUuid());
 
-        for (int x = -RADIUS; x <= RADIUS; x++) {
-            for (int z = -RADIUS; z <= RADIUS; z++) {
-                wanted.computeIfAbsent(far.dimension(), key -> new HashSet<>())
-                        .add(ChunkPos.toLong(centre.x + x, centre.z + z));
+        if (sent == null) {
+            if (far == null) {
+                return;
             }
-        }
-    }
 
-    private static void sync(MinecraftServer server, ServerPlayerEntity player,
-                             Map<RegistryKey<World>, Set<Long>> wanted) {
-        Map<RegistryKey<World>, Set<Long>> sent =
-                SENT.computeIfAbsent(player.getUuid(), uuid -> new HashMap<>());
+            sent = new HashMap<>();
+            SENT.put(player.getUuid(), sent);
+        }
 
         RegistryKey<World> playerDimension = player.getEntityWorld().getRegistryKey();
+        RegistryKey<World> wantedDimension = far == null ? null : far.dimension();
+        ChunkPos centre = far == null ? null : new ChunkPos(BlockPos.ofFloored(far.center()));
 
-        for (Map.Entry<RegistryKey<World>, Set<Long>> entry : new HashMap<>(sent).entrySet()) {
+        // Unloads go out at once and in full. They cost nothing to make or to apply, and the
+        // client's window of chunks may be about to move somewhere these would not fit.
+        for (Iterator<Map.Entry<RegistryKey<World>, LongSet>> entries = sent.entrySet().iterator(); entries.hasNext(); ) {
+            Map.Entry<RegistryKey<World>, LongSet> entry = entries.next();
             RegistryKey<World> dimension = entry.getKey();
-            Set<Long> stillWanted = wanted.getOrDefault(dimension, Set.of());
+            boolean wanted = dimension == wantedDimension;
 
-            for (Long key : new HashSet<>(entry.getValue())) {
-                if (stillWanted.contains(key)) {
+            for (LongIterator chunks = entry.getValue().iterator(); chunks.hasNext(); ) {
+                long key = chunks.nextLong();
+
+                if (wanted && Math.abs(ChunkPos.getPackedX(key) - centre.x) <= RADIUS
+                        && Math.abs(ChunkPos.getPackedZ(key) - centre.z) <= RADIUS) {
                     continue;
                 }
 
@@ -163,43 +189,64 @@ public class RemoteChunkTracker {
                     PacketRedirection.send(player, dimension, new UnloadChunkS2CPacket(new ChunkPos(key)));
                 }
 
-                entry.getValue().remove(key);
+                chunks.remove();
             }
 
-            sent.put(dimension, entry.getValue());
+            if (entry.getValue().isEmpty()) {
+                entries.remove();
+            }
         }
 
-        for (Map.Entry<RegistryKey<World>, Set<Long>> entry : wanted.entrySet()) {
-            RegistryKey<World> dimension = entry.getKey();
+        if (far == null) {
+            return;
+        }
 
-            ServerWorld world = server.getWorld(dimension);
-            if (world == null) {
+        ServerWorld world = server.getWorld(wantedDimension);
+        if (world == null) {
+            return;
+        }
+
+        LongSet alreadySent = sent.get(wantedDimension);
+
+        // Everything is there, which is the state this spends nearly all of its time in.
+        if (alreadySent != null && alreadySent.size() >= NEAREST_FIRST.length) {
+            return;
+        }
+
+        int budget = CHUNKS_PER_TICK;
+
+        for (int[] offset : NEAREST_FIRST) {
+            int x = centre.x + offset[0];
+            int z = centre.z + offset[1];
+            long key = ChunkPos.toLong(x, z);
+
+            if (alreadySent != null && alreadySent.contains(key)) {
                 continue;
             }
 
-            Set<Long> alreadySent = sent.computeIfAbsent(dimension, key -> new HashSet<>());
+            WorldChunk chunk = world.getChunkManager().getWorldChunk(x, z);
 
-            for (Long key : entry.getValue()) {
-                if (alreadySent.contains(key)) {
-                    continue;
-                }
+            if (chunk == null) {
+                // Not generated yet. PortalChunkLoader holds tickets on the anchors, so this
+                // resolves on a later pass rather than blocking the tick to generate it here.
+                continue;
+            }
 
-                ChunkPos pos = new ChunkPos(key);
-                WorldChunk chunk = world.getChunkManager().getWorldChunk(pos.x, pos.z);
+            PacketRedirection.send(
+                    player,
+                    wantedDimension,
+                    new ChunkDataS2CPacket(chunk, world.getLightingProvider(), null, null)
+            );
 
-                if (chunk == null) {
-                    // Not generated yet. PortalChunkLoader holds tickets on the anchors, so this
-                    // resolves on a later pass rather than blocking the tick to generate it here.
-                    continue;
-                }
+            if (alreadySent == null) {
+                alreadySent = new LongOpenHashSet();
+                sent.put(wantedDimension, alreadySent);
+            }
 
-                PacketRedirection.send(
-                        player,
-                        dimension,
-                        new ChunkDataS2CPacket(chunk, world.getLightingProvider(), null, null)
-                );
+            alreadySent.add(key);
 
-                alreadySent.add(key);
+            if (--budget == 0) {
+                break;
             }
         }
     }
@@ -221,7 +268,7 @@ public class RemoteChunkTracker {
      * never resends it, and the doorway shows the void until the player walks out of range.
      */
     public static void onWorldChange(ServerPlayerEntity player, RegistryKey<World> destination) {
-        Map<RegistryKey<World>, Set<Long>> sent = SENT.get(player.getUuid());
+        Map<RegistryKey<World>, LongSet> sent = SENT.get(player.getUuid());
         if (sent != null) {
             sent.remove(destination);
         }
@@ -229,12 +276,12 @@ public class RemoteChunkTracker {
 
     /** Whether any of {@code dimension} is currently being streamed to {@code player}. */
     public static boolean isStreaming(ServerPlayerEntity player, RegistryKey<World> dimension) {
-        Map<RegistryKey<World>, Set<Long>> sent = SENT.get(player.getUuid());
+        Map<RegistryKey<World>, LongSet> sent = SENT.get(player.getUuid());
         if (sent == null) {
             return false;
         }
 
-        Set<Long> chunks = sent.get(dimension);
+        LongSet chunks = sent.get(dimension);
         return chunks != null && !chunks.isEmpty();
     }
 
@@ -250,8 +297,8 @@ public class RemoteChunkTracker {
         long key = pos.toLong();
         List<ServerPlayerEntity> result = null;
 
-        for (Map.Entry<UUID, Map<RegistryKey<World>, Set<Long>>> entry : SENT.entrySet()) {
-            Set<Long> chunks = entry.getValue().get(dimension);
+        for (Map.Entry<UUID, Map<RegistryKey<World>, LongSet>> entry : SENT.entrySet()) {
+            LongSet chunks = entry.getValue().get(dimension);
             if (chunks == null || !chunks.contains(key)) {
                 continue;
             }

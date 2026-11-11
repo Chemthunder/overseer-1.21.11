@@ -2,6 +2,7 @@ package net.damagejr05.overseer.core.client;
 
 import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
 import net.damagejr05.overseer.core.index.ModDimensions;
+import net.damagejr05.overseer.core.client.render.MemoryAtmosphere;
 import net.damagejr05.overseer.core.client.render.PortalViewRenderer;
 import net.damagejr05.overseer.core.portal.PortalAnchor;
 import net.damagejr05.overseer.core.portal.PortalPair;
@@ -47,6 +48,8 @@ public class ClientDebugCommand {
 
                     line(client, "see-through: " + (PortalViewRenderer.isEnabled() ? "on" : "off (procedural aperture)"),
                             PortalViewRenderer.isEnabled() ? Formatting.GREEN : Formatting.YELLOW);
+                    line(client, "crop to doorway: " + (PortalViewRenderer.isCropEnabled() ? "on" : "off (full-screen)"),
+                            PortalViewRenderer.isCropEnabled() ? Formatting.GREEN : Formatting.YELLOW);
 
                     line(client, "drawing " + PortalViewRenderer.visible().size() + " portal(s) here", Formatting.WHITE);
                     line(client, PortalViewRenderer.describeLastRender(), Formatting.LIGHT_PURPLE);
@@ -61,6 +64,12 @@ public class ClientDebugCommand {
                 })).then(literal("portalview")
                         .then(literal("on").executes(context -> setPortalView(true)))
                         .then(literal("off").executes(context -> setPortalView(false))))
+                        .then(literal("crop")
+                                .then(literal("on").executes(context -> setCrop(true)))
+                                .then(literal("off").executes(context -> setCrop(false))))
+                        .then(literal("glow")
+                                .then(literal("on").executes(context -> setGlow(true)))
+                                .then(literal("off").executes(context -> setGlow(false))))
                         .then(literal("solid")
                                 .then(literal("on").executes(context -> {
                                     PortalViewRenderer.setSolidDebug(true);
@@ -86,6 +95,31 @@ public class ClientDebugCommand {
 
         MinecraftClient client = MinecraftClient.getInstance();
         line(client, "Portal see-through " + (enabled ? "enabled" : "disabled (procedural aperture)"),
+                enabled ? Formatting.GREEN : Formatting.YELLOW);
+
+        return 1;
+    }
+
+    /**
+     * The far side is normally rendered only as large as the doorway appears on screen. Off
+     * renders the whole screen every frame, as it used to: slower, and otherwise no different.
+     */
+    private static int setCrop(boolean enabled) {
+        PortalViewRenderer.setCropEnabled(enabled);
+
+        line(MinecraftClient.getInstance(),
+                "Portal view " + (enabled ? "rendered at the doorway's size" : "rendered full-screen (slower)"),
+                enabled ? Formatting.GREEN : Formatting.YELLOW);
+
+        return 1;
+    }
+
+    /** The memory dimension's post effect: glow, vignette and grain. */
+    private static int setGlow(boolean enabled) {
+        MemoryAtmosphere.setEnabled(enabled);
+
+        line(MinecraftClient.getInstance(),
+                "Memory dimension glow " + (enabled ? "on" : "off"),
                 enabled ? Formatting.GREEN : Formatting.YELLOW);
 
         return 1;

@@ -5,6 +5,7 @@ import net.damagejr05.overseer.core.net.PortalTransitionPayload;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -141,7 +142,6 @@ public class PortalTraversal {
         }
 
         Vec3d exitFeet = transform.applyPoint(crossing.at()).subtract(0, entity.getHeight() / 2.0, 0);
-        Vec3d exitVelocity = transform.applyVector(entity.getVelocity());
 
         // As for players: land in a chunk that exists, not one that is about to.
         destination.getChunk(BlockPos.ofFloored(exitFeet));
@@ -149,17 +149,21 @@ public class PortalTraversal {
         if (destination != entity.getEntityWorld()) {
             for (Entity passenger : entity.getPassengersDeep()) {
                 if (passenger instanceof ServerPlayerEntity player) {
-                    ServerPlayNetworking.send(player, PortalTransitionPayload.INSTANCE);
+                    ServerPlayNetworking.send(player, new PortalTransitionPayload(transform));
                 }
             }
         }
 
+        // A turn rather than a facing, as for players on foot. For the entity itself the two
+        // come to the same thing; for anyone riding it the difference is whether their view is
+        // turned with the vehicle or snapped to where the server last saw it pointing.
         entity.teleportTo(new TeleportTarget(
                 destination,
                 exitFeet,
-                exitVelocity,
-                transform.applyYaw(entity.getYaw()),
-                entity.getPitch(),
+                Vec3d.ZERO,
+                transform.yawDelta(),
+                0.0F,
+                PositionFlag.combine(PositionFlag.DELTA, PositionFlag.ROT),
                 TeleportTarget.NO_OP
         ));
     }

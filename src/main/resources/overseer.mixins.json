@@ -11,6 +11,7 @@
     "PlayerEntityMixin",
     "PlayerManagerMixin",
     "ServerCommonNetworkHandlerMixin",
+    "ServerPlayNetworkHandlerMixin",
     "StatusEffectUtilMixin"
   ],
   "injectors": {

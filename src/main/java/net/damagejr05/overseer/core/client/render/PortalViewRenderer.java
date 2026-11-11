@@ -12,6 +12,7 @@ import net.damagejr05.overseer.core.cca.world.DoorwayComponent;
 import net.damagejr05.overseer.core.client.SecondaryWorldManager;
 import net.damagejr05.overseer.core.portal.PortalAnchor;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -36,12 +37,14 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.World;
 import net.minecraft.world.attribute.EnvironmentAttributeInterpolator;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
+import org.joml.Matrix4fStack;
 import org.joml.Quaternionf;
 import org.joml.Vector4f;
 
@@ -139,7 +142,65 @@ public class PortalViewRenderer {
         return through != null && valid && through.equals(renderedEntry);
     }
 
-    private static void trackCrossing(MinecraftClient client, ClientWorld world, Vec3d cameraPos) {
+    /**
+     * The doorway the player has just come out of, until the camera has come out of it too.
+     *
+     * <p>The camera does not sit at the player's position. It is drawn part-way between where
+     * the player was last tick and where they are now, so it runs up to a tick behind -- and the
+     * server's answer to a crossing can arrive inside that tick. The player is then through, and
+     * for the next few frames the camera, following smoothly on behind, is not: it is still on
+     * the wrong side of the plane of the doorway it is emerging from.
+     *
+     * <p>Nothing about that is wrong, but two things here used to misread it. The doorway's
+     * surface was drawn in front of the camera, showing the place just left. And when the camera
+     * did reach the plane a moment later, that looked exactly like someone walking into the
+     * doorway, so the whole screen was filled with the far side -- the place just left again --
+     * until the wait for a crossing that was never coming timed out. Stepping through showed the
+     * new world, then the old one for most of a second, then the new one.
+     *
+     * <p>While this is set that doorway's surface is not drawn and its plane is not watched. The
+     * camera finishes coming through an open frame, which is what the frame before showed.
+     */
+    private static @Nullable PortalAnchor emerging = null;
+    private static boolean emergingToFront = true;
+    private static long emergingSince = 0L;
+
+    /** Longer than any camera takes to catch up; only there so that a missed end cannot stick. */
+    private static final long EMERGE_TIMEOUT_MS = 1_000L;
+
+    /**
+     * The player has been carried out of {@code exit} and now stands at {@code position}, with
+     * the camera still to follow.
+     */
+    public static void arrivedThrough(PortalAnchor exit, Vec3d position) {
+        emerging = exit;
+        emergingToFront = exit.signedDistance(position) >= 0.0;
+        emergingSince = System.currentTimeMillis();
+    }
+
+    /** Whether the camera is still coming out of {@code anchor} after a crossing. */
+    public static boolean isEmerging(PortalAnchor anchor) {
+        return emerging != null && emerging.equals(anchor)
+                && System.currentTimeMillis() - emergingSince <= EMERGE_TIMEOUT_MS;
+    }
+
+    /** End the emergence once the camera is out on the side the player came out on. */
+    private static void trackEmergence(ClientWorld world, Vec3d cameraPos) {
+        if (emerging == null) {
+            return;
+        }
+
+        double distance = emerging.signedDistance(cameraPos);
+        boolean out = emergingToFront ? distance > 0.0 : distance < 0.0;
+
+        if (out || emerging.dimension() != world.getRegistryKey()
+                || System.currentTimeMillis() - emergingSince > EMERGE_TIMEOUT_MS) {
+            emerging = null;
+        }
+    }
+
+    private static void trackCrossing(MinecraftClient client, ClientWorld world, Vec3d cameraPos,
+                                      @Nullable PortalAnchor emergingFrom) {
         // A new world means the crossing happened. Nothing measured in the old one carries over.
         if (world != lastWorld) {
             lastWorld = world;
@@ -161,6 +222,13 @@ public class PortalViewRenderer {
             Double before = LAST_DISTANCE.put(anchor, distance);
 
             if (before == null || lastCameraPos == null || through != null || !willCross) {
+                continue;
+            }
+
+            // The camera reaching this plane is the end of the crossing just made, not the
+            // start of another. Its distance is still recorded above, so that turning straight
+            // round and walking back in is measured from the right side.
+            if (anchor.equals(emergingFrom)) {
                 continue;
             }
 
@@ -190,6 +258,291 @@ public class PortalViewRenderer {
         }
 
         lastCameraPos = cameraPos;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // How much of the screen to render
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * The far side is only ever seen through the opening, so only the part of the screen the
+     * opening covers is rendered.
+     *
+     * <p>It used to be the whole screen, every frame: a second world drawn at full resolution so
+     * that a doorway across the room could show a patch of it a couple of hundred pixels high.
+     * On anything where filling pixels is the expensive part -- which is every integrated GPU --
+     * that doubled the cost of the frame for as long as a doorway was in sight.
+     *
+     * <p>Instead the offscreen target is made just large enough to hold the opening, and the
+     * projection is cropped to that same rectangle of the screen. The crop is an exact number of
+     * pixels placed on a pixel boundary, so every texel of the target is the texel the full-size
+     * render would have produced there and nothing is resampled; the compositor only has to know
+     * where on the screen the rectangle sits, which is {@link #viewRect()}.
+     *
+     * <p>The target's size moves in steps of an eighth of the screen rather than tracking the
+     * opening pixel for pixel, because resizing it means reallocating it. It grows the moment it
+     * has to and shrinks only once the smaller size has been enough for a while.
+     */
+    private static final int CROP_STEPS = 8;
+
+    /** Frames a smaller target must have sufficed before it is actually made smaller. */
+    private static final int SHRINK_AFTER_FRAMES = 40;
+
+    /**
+     * Room left around the opening, in normalised device coordinates. The compositor ripples the
+     * view near the frame and samples it with linear filtering, both of which reach a little
+     * outside the opening's own outline.
+     */
+    private static final float CROP_MARGIN = 0.02F;
+
+    /** One axis of the target's size, in steps, with the grow-fast shrink-slow rule applied. */
+    private static final class CropAxis {
+        private int steps = 0;
+        private int calmFrames = 0;
+
+        int fit(int needed) {
+            if (needed >= steps) {
+                steps = needed;
+                calmFrames = 0;
+            } else if (++calmFrames >= SHRINK_AFTER_FRAMES) {
+                steps = needed;
+                calmFrames = 0;
+            }
+
+            return steps;
+        }
+
+        void reset() {
+            steps = 0;
+            calmFrames = 0;
+        }
+    }
+
+    /**
+     * Cropping can be switched off with {@code /overseerclient crop off}, which goes back to
+     * rendering the whole screen. The picture should be identical either way, so if a doorway's
+     * view ever looks shifted or stretched this is the way to find out whether the crop is why.
+     */
+    private static boolean cropEnabled = Boolean.parseBoolean(System.getProperty("overseer.portalCrop", "true"));
+
+    public static boolean isCropEnabled() {
+        return cropEnabled;
+    }
+
+    public static void setCropEnabled(boolean value) {
+        cropEnabled = value;
+    }
+
+    private static final CropAxis CROP_X = new CropAxis();
+    private static final CropAxis CROP_Y = new CropAxis();
+    private static @Nullable PortalAnchor cropAnchor = null;
+
+    /** This frame's crop: the target's size in pixels and where its corner sits on the screen. */
+    private static int cropWidth = 1;
+    private static int cropHeight = 1;
+    private static int cropLeft = 0;
+    private static int cropBottom = 0;
+
+    /** Applied on top of the projection to rasterise only the cropped rectangle. */
+    private static final Matrix4f CROP = new Matrix4f();
+
+    /**
+     * Where the view last rendered sits on screen: its lower-left corner in screen UV, and the
+     * reciprocal of its size. Only replaced when a view is actually rendered, so a view that is
+     * fading out is still sampled where it was drawn.
+     */
+    private static final Vector4f VIEW_RECT = new Vector4f(0.0F, 0.0F, 1.0F, 1.0F);
+
+    public static Vector4f viewRect() {
+        return VIEW_RECT;
+    }
+
+    /**
+     * Work out this frame's crop for the doorway about to be rendered.
+     *
+     * <p>Falls back to the whole screen whenever the opening's outline cannot be trusted: while
+     * the camera is passing through it, and whenever any corner is level with or behind the
+     * camera, where a screen position means nothing.
+     */
+    private static void chooseCrop(PortalAnchor entry, boolean round, boolean wholeScreen, Vec3d cameraPos,
+                                   Matrix4f view, Matrix4f projection, int screenWidth, int screenHeight) {
+        if (!entry.equals(cropAnchor)) {
+            cropAnchor = entry;
+            CROP_X.reset();
+            CROP_Y.reset();
+        }
+
+        float left = -1.0F, right = 1.0F, bottom = -1.0F, top = 1.0F;
+
+        if (!wholeScreen && cropEnabled) {
+            // The surface as the compositor will draw it, which near the plane is not on it.
+            Vec3d centre = entry.center().subtract(cameraPos);
+            if (!round) {
+                centre = centre.add(entry.normal().multiply(PortalGeometry.retreat(entry, cameraPos)));
+            }
+
+            Vec3d across = entry.right().multiply(entry.width() / 2.0);
+            double up = entry.height() / 2.0;
+
+            Matrix4f viewProjection = new Matrix4f(projection).mul(view);
+            Vector4f clip = new Vector4f();
+
+            float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, minY = Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+            boolean usable = true;
+
+            for (int corner = 0; corner < 4; corner++) {
+                Vec3d point = centre
+                        .add(across.multiply((corner & 1) == 0 ? -1.0 : 1.0))
+                        .add(0, (corner & 2) == 0 ? -up : up, 0);
+
+                clip.set((float) point.x, (float) point.y, (float) point.z, 1.0F);
+                viewProjection.transform(clip);
+
+                if (!(clip.w > 0.01F)) {
+                    usable = false;
+                    break;
+                }
+
+                float x = clip.x / clip.w;
+                float y = clip.y / clip.w;
+
+                minX = Math.min(minX, x);
+                maxX = Math.max(maxX, x);
+                minY = Math.min(minY, y);
+                maxY = Math.max(maxY, y);
+            }
+
+            // A corner only just in front of the camera can divide out to infinity, or to nothing
+            // at all. Either way there is no outline to crop to, and the whole screen is safe.
+            if (usable && Float.isFinite(minX) && Float.isFinite(maxX) && Float.isFinite(minY) && Float.isFinite(maxY)) {
+                left = Math.max(minX - CROP_MARGIN, -1.0F);
+                right = Math.min(maxX + CROP_MARGIN, 1.0F);
+                bottom = Math.max(minY - CROP_MARGIN, -1.0F);
+                top = Math.min(maxY + CROP_MARGIN, 1.0F);
+
+                if (!(right > left) || !(top > bottom)) {
+                    left = -1.0F;
+                    right = 1.0F;
+                    bottom = -1.0F;
+                    top = 1.0F;
+                }
+            }
+        }
+
+        float neededWidth = (right - left) * 0.5F * screenWidth;
+        float neededHeight = (top - bottom) * 0.5F * screenHeight;
+
+        int stepsX = CROP_X.fit(stepsFor(neededWidth, screenWidth));
+        int stepsY = CROP_Y.fit(stepsFor(neededHeight, screenHeight));
+
+        cropWidth = stepsX >= CROP_STEPS ? screenWidth : Math.max(1, (screenWidth * stepsX + CROP_STEPS - 1) / CROP_STEPS);
+        cropHeight = stepsY >= CROP_STEPS ? screenHeight : Math.max(1, (screenHeight * stepsY + CROP_STEPS - 1) / CROP_STEPS);
+
+        // Centred on the opening, on a whole pixel, and never hanging off the screen.
+        float openingLeft = (left + 1.0F) * 0.5F * screenWidth;
+        float openingBottom = (bottom + 1.0F) * 0.5F * screenHeight;
+
+        cropLeft = MathHelper.clamp(MathHelper.floor(openingLeft - (cropWidth - neededWidth) * 0.5F), 0, screenWidth - cropWidth);
+        cropBottom = MathHelper.clamp(MathHelper.floor(openingBottom - (cropHeight - neededHeight) * 0.5F), 0, screenHeight - cropHeight);
+
+        // In clip space the crop is a scale about its own centre: x' = (x - cx * w) / hx.
+        float halfX = (float) cropWidth / screenWidth;
+        float halfY = (float) cropHeight / screenHeight;
+        float centreX = (cropLeft + cropWidth * 0.5F) / screenWidth * 2.0F - 1.0F;
+        float centreY = (cropBottom + cropHeight * 0.5F) / screenHeight * 2.0F - 1.0F;
+
+        CROP.translation(-centreX / halfX, -centreY / halfY, 0.0F).scale(1.0F / halfX, 1.0F / halfY, 1.0F);
+    }
+
+    private static int stepsFor(float neededPixels, int screenPixels) {
+        return MathHelper.clamp(MathHelper.ceil(neededPixels * CROP_STEPS / screenPixels), 1, CROP_STEPS);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Giving memory back
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * Frames since a view was last rendered. The offscreen target is a colour and a depth texture
+     * as large as the opening has ever needed -- the size of the screen, after walking through --
+     * and with no doorway in sight it is doing nothing but occupying video memory.
+     */
+    private static int idleFrames = 0;
+
+    /** Long enough that the compositor has finished fading the last view out several times over. */
+    private static final int IDLE_FRAMES_BEFORE_RELEASE = 600;
+
+    /** A target this small or smaller is only a placeholder for the sampler and not worth freeing. */
+    static final int PLACEHOLDER_SIZE = 16;
+
+    private static void releaseIdleTarget() {
+        if (target == null || !target.isPrepared()) {
+            return;
+        }
+
+        Framebuffer framebuffer = target.framebuffer();
+        if (framebuffer.textureWidth <= PLACEHOLDER_SIZE && framebuffer.textureHeight <= PLACEHOLDER_SIZE) {
+            return;
+        }
+
+        target.close();
+        PortalViewCompositor.onViewReleased();
+    }
+
+    /**
+     * Forget everything about the session that has just ended.
+     *
+     * <p>Most of this state is small, but not all of it is harmless to keep: the world last
+     * rendered is referenced from here, and a client world holds every chunk it has loaded. Left
+     * set, the whole of the last world stayed alive on the title screen until another was joined.
+     * The render targets are released for the same reason -- nothing is going to draw into them
+     * from a menu.
+     */
+    public static void reset() {
+        valid = false;
+        renderedEntry = null;
+        culledOffScreen = false;
+        visible.clear();
+
+        through = null;
+        emerging = null;
+        LAST_DISTANCE.clear();
+        lastCameraPos = null;
+        lastWorld = null;
+
+        ENVIRONMENTS.clear();
+        ENVIRONMENT_AGES.clear();
+        lightmapDimension = null;
+        lightmapAge = -1;
+
+        lastExit = null;
+        lastVirtualPos = null;
+        lastRenderedCameraPos = null;
+        scenePositionMatrix = null;
+        nestedPositionMatrix = null;
+
+        cropAnchor = null;
+        CROP_X.reset();
+        CROP_Y.reset();
+        VIEW_RECT.set(0.0F, 0.0F, 1.0F, 1.0F);
+        idleFrames = 0;
+        consecutiveFailures = 0;
+
+        if (RenderSystem.isOnRenderThread()) {
+            releaseGpuResources();
+        } else {
+            MinecraftClient.getInstance().execute(PortalViewRenderer::releaseGpuResources);
+        }
+    }
+
+    private static void releaseGpuResources() {
+        POOL.clear();
+
+        if (target != null) {
+            target.close();
+        }
+
+        PortalViewCompositor.onViewReleased();
     }
 
     /** Guards against recursion: a portal seen through a portal renders flat. */
@@ -353,7 +706,7 @@ public class PortalViewRenderer {
         ) + (lastRenderedCameraPos == null ? "" : String.format(
                 " | renderer saw %.1f %.1f %.1f",
                 lastRenderedCameraPos.x, lastRenderedCameraPos.y, lastRenderedCameraPos.z
-        ));
+        )) + String.format(" | rendered %dx%d at %d,%d", cropWidth, cropHeight, cropLeft, cropBottom);
     }
 
     public static @Nullable ManagedRenderTarget target() {
@@ -383,6 +736,17 @@ public class PortalViewRenderer {
             return;
         }
 
+        // Every frame, whether or not a view is rendered in it. Vanilla advances its own pool
+        // once per frame; this one used to be advanced only on frames that drew a view, so the
+        // moment the last doorway left the screen whatever it held -- up to five full-size
+        // framebuffers with fancy transparency on -- was stranded there for good.
+        POOL.decrementLifespan();
+
+        if (++idleFrames >= IDLE_FRAMES_BEFORE_RELEASE) {
+            idleFrames = 0;
+            releaseIdleTarget();
+        }
+
         MinecraftClient client = MinecraftClient.getInstance();
         ClientWorld world = client.world;
 
@@ -395,11 +759,18 @@ public class PortalViewRenderer {
         // Everything in this dimension gets drawn, from any angle.
         visible.addAll(doorways.anchorsIn(world.getRegistryKey()));
 
+        // Whether or not the live view is on: the procedural aperture gets in the way of an
+        // emerging camera just the same. Taken before it is updated, because the frame on which
+        // the camera comes out is the very one the crossing test must not see.
+        Vec3d cameraPos = client.gameRenderer.getCamera().getCameraPos();
+        PortalAnchor emergingFrom = emerging;
+        trackEmergence(world, cameraPos);
+
         if (!enabled) {
             return;
         }
 
-        trackCrossing(client, world, client.gameRenderer.getCamera().getCameraPos());
+        trackCrossing(client, world, cameraPos, emergingFrom);
 
         // The doorway being walked through, if there is one; otherwise the nearest on screen.
         PortalTransform transform = null;
@@ -435,9 +806,12 @@ public class PortalViewRenderer {
             return;
         }
 
-        // Vanilla advances its own pool once per frame; ours has to be advanced too or the
-        // transient framebuffers it hands out are never recycled.
-        POOL.decrementLifespan();
+        Framebuffer screen = client.getFramebuffer();
+        chooseCrop(
+                transform.from(), doorways.isEvictionAnchor(transform.from()), passingThrough,
+                client.gameRenderer.getCamera().getCameraPos(), framePositionMatrix, frameBasicProjection,
+                screen.textureWidth, screen.textureHeight
+        );
 
         rendering = true;
         try {
@@ -447,6 +821,14 @@ public class PortalViewRenderer {
                     frameBasicProjection, frameProjection, frameFog, frameFogColor, !passingThrough)) {
                 valid = true;
                 renderedEntry = transform.from();
+                idleFrames = 0;
+
+                VIEW_RECT.set(
+                        (float) cropLeft / screen.textureWidth,
+                        (float) cropBottom / screen.textureHeight,
+                        (float) screen.textureWidth / cropWidth,
+                        (float) screen.textureHeight / cropHeight
+                );
             }
 
             consecutiveFailures = 0;
@@ -620,8 +1002,8 @@ public class PortalViewRenderer {
             return false;
         }
 
-        Framebuffer main = client.getFramebuffer();
-        Framebuffer offscreen = target.prepare(main.textureWidth, main.textureHeight);
+        // Sized to this frame's crop, not to the screen; see chooseCrop.
+        Framebuffer offscreen = target.prepare(cropWidth, cropHeight);
 
         // WorldRenderer reads the camera from shared GameRenderer state in a dozen places rather
         // than only from the argument, so handing it a separate Camera object would mix a virtual
@@ -649,6 +1031,8 @@ public class PortalViewRenderer {
         LightmapTextureManager previousLightmap = client.gameRenderer.lightmapTextureManager;
         RegistryKey<World> farDimension = transform.to().dimension();
         int age = OverseerClient.age;
+        Matrix4fStack modelView = RenderSystem.getModelViewStack();
+        int modelViewDepth = depthOf(modelView);
 
         try {
             virtualCamera.setPos(virtualPos);
@@ -699,6 +1083,12 @@ public class PortalViewRenderer {
             // One call either way, not a choice between two expressions that each make a matrix:
             // see ObliqueProjection.apply for why that distinction crashes the JVM.
             Matrix4f clipped = ObliqueProjection.apply(basicProjection, positionMatrix, virtualPos, transform.to(), clipToPortal);
+
+            // Then cropped to the rectangle of the screen the offscreen target stands for. This
+            // only rescales and shifts x and y, so the depth row the oblique clip has just
+            // rewritten is untouched. Applied unconditionally -- it is the identity when the
+            // target covers the screen -- for the reason given above about branches.
+            clipped.mulLocal(CROP);
 
             // The far world's own fog, from our own FogRenderer so the main render's slice survives.
             //
@@ -762,7 +1152,7 @@ public class PortalViewRenderer {
             // culled and meshed correctly around the virtual camera -- were still being placed
             // relative to the real one. That is the offset that made the portal show the entry's
             // surroundings.
-            writeGlobals(client, globals, tickCounter, farWorld);
+            writeGlobals(client, globals, tickCounter, farWorld, cropWidth, cropHeight);
 
             // Colour needs no clear: renderSky fills every pixel. Depth does, or last frame's depth
             // would occlude this one.
@@ -824,6 +1214,7 @@ public class PortalViewRenderer {
 
             return true;
         } finally {
+            unwind(modelView, modelViewDepth);
             nestedPositionMatrix = null;
             client.gameRenderer.lightmapTextureManager = previousLightmap;
             virtualCamera.environmentAttributeInterpolator = realEnvironment;
@@ -835,7 +1226,57 @@ public class PortalViewRenderer {
             realCamera.setPos(realPos);
             realCamera.setRotation(realYaw, realPitch);
             // Only valid once the camera is back, since it reads the camera off the game renderer.
-            writeGlobals(client, globals, tickCounter, client.world);
+            writeGlobals(client, globals, tickCounter, client.world,
+                    client.getWindow().getFramebufferWidth(), client.getWindow().getFramebufferHeight());
+        }
+    }
+
+    /**
+     * JOML keeps a matrix stack's depth private, and offers no way to ask for it.
+     *
+     * <p>It is needed for one thing. The world renderer pushes the view rotation onto the shared
+     * model-view stack on its way in and pops it on its way out, and an exception anywhere in
+     * between skips the pop. Every other piece of borrowed state is put back by the caller, but
+     * this one was not: a single failed portal frame -- which is supposed to cost one frame and
+     * nothing else -- left the virtual camera's rotation on the stack, where the main render
+     * multiplied its own on top of it. Everything drawn through the stack then came out turned
+     * the wrong way until the game was restarted, and sixteen such frames overflowed the stack
+     * and took the client down.
+     */
+    private static final @Nullable Field MATRIX_STACK_DEPTH = findMatrixStackDepth();
+
+    private static @Nullable Field findMatrixStackDepth() {
+        try {
+            Field field = Matrix4fStack.class.getDeclaredField("curr");
+            field.setAccessible(true);
+            return field;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            Overseer.LOGGER.warn("Cannot read the model-view stack's depth; a failed portal frame will not be unwound", e);
+            return null;
+        }
+    }
+
+    /** @return the stack's depth, or -1 if it cannot be told */
+    private static int depthOf(Matrix4fStack stack) {
+        if (MATRIX_STACK_DEPTH == null) {
+            return -1;
+        }
+
+        try {
+            return MATRIX_STACK_DEPTH.getInt(stack);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return -1;
+        }
+    }
+
+    /** Pop whatever a render that did not finish left on the stack. A no-op after one that did. */
+    private static void unwind(Matrix4fStack stack, int depth) {
+        if (depth < 0) {
+            return;
+        }
+
+        for (int current = depthOf(stack); current > depth; current--) {
+            stack.popMatrix();
         }
     }
 
@@ -847,10 +1288,13 @@ public class PortalViewRenderer {
      * without reaching into the chunk shader.
      */
     private static void writeGlobals(MinecraftClient client, GlobalSettings globals,
-                                     RenderTickCounter tickCounter, @Nullable ClientWorld world) {
+                                     RenderTickCounter tickCounter, @Nullable ClientWorld world,
+                                     int width, int height) {
+        // The size is what shaders take for the size of the surface they are drawing to -- line
+        // widths are worked out from it -- and for the nested render that is the offscreen target.
         globals.set(
-                client.getWindow().getFramebufferWidth(),
-                client.getWindow().getFramebufferHeight(),
+                width,
+                height,
                 client.options.getGlintStrength().getValue(),
                 world == null ? 0L : world.getTime(),
                 tickCounter,

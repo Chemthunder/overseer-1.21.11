@@ -19,6 +19,7 @@ import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
+import net.minecraft.client.option.GraphicsMode;
 import net.minecraft.client.render.BufferBuilder;
 import net.minecraft.client.render.BuiltBuffer;
 import net.minecraft.client.render.VertexFormats;
@@ -35,9 +36,12 @@ import java.util.OptionalInt;
  * The sky of the memory dimension.
  *
  * <p>The dimension has no skybox, so vanilla draws nothing above the floor but the fog colour.
- * This fills that space: a slow nebula, stars, an aurora low on the horizon, and an eclipsed eye
- * hanging in the north. All of it is computed per pixel from the direction being looked in, so
- * there are no textures and nothing to tile or stretch.
+ * This fills that space with a pane of broken glass: black and white, lit from behind through
+ * the cracks, every piece still holding its own slant of the same remembered place. It is
+ * struck again from time to time and shatters further before drawing back together, and now
+ * and then an eye comes to one of the pieces and looks through. All of it is computed per pixel
+ * from the direction being looked in, so there are no textures and nothing to tile or stretch;
+ * what happens when is taken from the world's clock, so everyone sees the same sky.
  *
  * <p>It is drawn after the solid world, as a cube around the camera pushed out to the far plane.
  * The depth test then lets it through only where nothing else was drawn, which is the sky.
@@ -51,6 +55,29 @@ import java.util.OptionalInt;
 @Environment(EnvType.CLIENT)
 public class MemorySkyRenderer {
     private static @Nullable ShaderMaterial material;
+
+    /**
+     * How much of the sky the shader draws: 1 for all of it, 0 for the plain version, which
+     * leaves out the loose splinters and uses a simpler cloud in the remembered skies. The
+     * pieces, the cracks, the strikes and the eye are there either way.
+     *
+     * <p>Follows the game's own graphics setting, so somebody who has chosen Fast gets the
+     * plain sky without having to know this exists. {@code -Doverseer.sky=plain} or
+     * {@code -Doverseer.sky=full} decides it regardless.
+     */
+    private static final @Nullable Float DETAIL_OVERRIDE = switch (System.getProperty("overseer.sky", "")) {
+        case "plain" -> 0.0F;
+        case "full" -> 1.0F;
+        default -> null;
+    };
+
+    private static float detail(MinecraftClient client) {
+        if (DETAIL_OVERRIDE != null) {
+            return DETAIL_OVERRIDE;
+        }
+
+        return client.options.getPreset().getValue() == GraphicsMode.FAST ? 0.0F : 1.0F;
+    }
 
     public static void init() {
         WorldRenderEvents.BEFORE_TRANSLUCENT.register(MemorySkyRenderer::render);
@@ -145,6 +172,9 @@ public class MemorySkyRenderer {
         Vector4f modulator = new Vector4f(0.0F, 0.0F, 0.0F, 1.0F);
         Vector3f toward = new Vector3f();
         Matrix4f state = new Matrix4f().zero();
+
+        // The third column's first entry: TextureMat[2].x in the shader.
+        state.m20(detail(client));
 
         // The player's own world, not client.world: inside a portal's nested render that is the
         // far world, whose copy of the doorway state is never synced.

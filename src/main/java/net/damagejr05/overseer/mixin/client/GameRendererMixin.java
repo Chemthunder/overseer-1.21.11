@@ -3,7 +3,9 @@ package net.damagejr05.overseer.mixin.client;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import net.damagejr05.overseer.core.client.render.MemoryAtmosphere;
 import net.damagejr05.overseer.core.client.render.PortalViewRenderer;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.Camera;
 import net.minecraft.client.render.GameRenderer;
 import net.minecraft.client.render.RenderTickCounter;
@@ -25,6 +27,9 @@ import org.spongepowered.asm.mixin.injection.At;
  *
  * <p>Running here also keeps the nested render outside the main render rather than re-entering it,
  * while still being late enough that every piece of per-frame setup is done.
+ *
+ * <p>The same wrap runs the memory dimension's post effect on the way out; see
+ * {@link MemoryAtmosphere}.
  *
  * @author Flex
  */
@@ -49,5 +54,10 @@ public class GameRendererMixin {
 
         original.call(renderer, allocator, tickCounter, renderBlockOutline, camera, positionMatrix,
                 basicProjectionMatrix, projectionMatrix, fogBuffer, fogColor, renderSky);
+
+        // The world is finished and the hand has not been drawn yet, which is where a filter on
+        // the world alone belongs. Only this call is wrapped, so the view through a doorway --
+        // which goes to its world renderer directly -- is never filtered twice.
+        MemoryAtmosphere.render(MinecraftClient.getInstance());
     }
 }

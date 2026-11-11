@@ -1,0 +1,206 @@
+{
+    "targets": {
+        "bright": {
+            "width": 480,
+            "height": 270
+        },
+        "blur": {
+            "width": 480,
+            "height": 270
+        },
+        "swap": {}
+    },
+    "passes": [
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "overseer:post/memory_bright",
+            "inputs": [
+                {
+                    "sampler_name": "Scene",
+                    "target": "minecraft:main",
+                    "bilinear": true
+                }
+            ],
+            "output": "bright",
+            "uniforms": {
+                "BrightConfig": [
+                    {
+                        "name": "Threshold",
+                        "type": "float",
+                        "value": 0.55
+                    },
+                    {
+                        "name": "Knee",
+                        "type": "float",
+                        "value": 0.25
+                    }
+                ]
+            }
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "overseer:post/memory_blur",
+            "inputs": [
+                {
+                    "sampler_name": "In",
+                    "target": "bright",
+                    "bilinear": true
+                }
+            ],
+            "output": "blur",
+            "uniforms": {
+                "BlurConfig": [
+                    {
+                        "name": "BlurDir",
+                        "type": "vec2",
+                        "value": [ 1.0, 0.0 ]
+                    },
+                    {
+                        "name": "Spread",
+                        "type": "float",
+                        "value": 1.0
+                    }
+                ]
+            }
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "overseer:post/memory_blur",
+            "inputs": [
+                {
+                    "sampler_name": "In",
+                    "target": "blur",
+                    "bilinear": true
+                }
+            ],
+            "output": "bright",
+            "uniforms": {
+                "BlurConfig": [
+                    {
+                        "name": "BlurDir",
+                        "type": "vec2",
+                        "value": [ 0.0, 1.0 ]
+                    },
+                    {
+                        "name": "Spread",
+                        "type": "float",
+                        "value": 1.0
+                    }
+                ]
+            }
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "overseer:post/memory_blur",
+            "inputs": [
+                {
+                    "sampler_name": "In",
+                    "target": "bright",
+                    "bilinear": true
+                }
+            ],
+            "output": "blur",
+            "uniforms": {
+                "BlurConfig": [
+                    {
+                        "name": "BlurDir",
+                        "type": "vec2",
+                        "value": [ 1.0, 0.0 ]
+                    },
+                    {
+                        "name": "Spread",
+                        "type": "float",
+                        "value": 2.4
+                    }
+                ]
+            }
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "overseer:post/memory_blur",
+            "inputs": [
+                {
+                    "sampler_name": "In",
+                    "target": "blur",
+                    "bilinear": true
+                }
+            ],
+            "output": "bright",
+            "uniforms": {
+                "BlurConfig": [
+                    {
+                        "name": "BlurDir",
+                        "type": "vec2",
+                        "value": [ 0.0, 1.0 ]
+                    },
+                    {
+                        "name": "Spread",
+                        "type": "float",
+                        "value": 2.4
+                    }
+                ]
+            }
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "overseer:post/memory_compose",
+            "inputs": [
+                {
+                    "sampler_name": "Scene",
+                    "target": "minecraft:main"
+                },
+                {
+                    "sampler_name": "Glow",
+                    "target": "bright",
+                    "bilinear": true
+                },
+                {
+                    "sampler_name": "Fade",
+                    "location": "overseer:memory_fade",
+                    "width": 1,
+                    "height": 1
+                }
+            ],
+            "output": "swap",
+            "uniforms": {
+                "HazeConfig": [
+                    {
+                        "name": "Glow",
+                        "type": "float",
+                        "value": 0.85
+                    },
+                    {
+                        "name": "Vignette",
+                        "type": "float",
+                        "value": 0.26
+                    },
+                    {
+                        "name": "Grain",
+                        "type": "float",
+                        "value": 0.016
+                    }
+                ]
+            }
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "minecraft:post/blit",
+            "inputs": [
+                {
+                    "sampler_name": "In",
+                    "target": "swap"
+                }
+            ],
+            "output": "minecraft:main",
+            "uniforms": {
+                "BlitConfig": [
+                    {
+                        "name": "ColorModulate",
+                        "type": "vec4",
+                        "value": [ 1.0, 1.0, 1.0, 1.0 ]
+                    }
+                ]
+            }
+        }
+    ]
+}

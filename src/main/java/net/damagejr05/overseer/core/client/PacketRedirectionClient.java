@@ -11,8 +11,11 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.network.listener.ClientPlayPacketListener;
 import net.minecraft.network.packet.Packet;
+import net.minecraft.network.packet.s2c.common.CustomPayloadS2CPacket;
+import net.minecraft.network.packet.s2c.play.BundleS2CPacket;
 import net.minecraft.network.packet.s2c.play.ChunkDataS2CPacket;
 import net.minecraft.network.packet.s2c.play.GameStateChangeS2CPacket;
+import net.minecraft.network.packet.s2c.play.UnloadChunkS2CPacket;
 import net.minecraft.network.packet.s2c.play.WorldTimeUpdateS2CPacket;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.util.math.BlockPos;
@@ -50,6 +53,18 @@ public class PacketRedirectionClient {
 
         Packet<ClientPlayPacketListener> packet = (Packet<ClientPlayPacketListener>) payload.packet();
 
+        // A redirect carries one packet about one world. The server unwraps bundles before
+        // tagging them and never tags a payload, so either of these inside a redirect is not
+        // something this mod sent -- and a redirect wrapped in a redirect would otherwise be
+        // unwrapped by calling straight back into here, as deep as the sender cared to nest it.
+        //
+        // Through Object, because a payload packet is declared for a wider listener than the
+        // play one and the compiler will not otherwise entertain the question.
+        Object carried = payload.packet();
+        if (carried instanceof CustomPayloadS2CPacket || carried instanceof BundleS2CPacket) {
+            return;
+        }
+
         // Only terrain brings a secondary world into being. Everything else describes a world
         // that should already exist, and if it does not -- it was dropped a moment ago, and this
         // is a late unload or a last entity update for it -- building a whole world and renderer
@@ -84,6 +99,9 @@ public class PacketRedirectionClient {
         // would change the view distance of the world the player is actually standing in.
         if (packet instanceof ChunkDataS2CPacket chunk) {
             centreOn(target, payload.dimension(), chunk.getChunkX(), chunk.getChunkZ());
+            SecondaryWorldManager.onStreamedChunk(payload.dimension(), chunk.getChunkX(), chunk.getChunkZ());
+        } else if (packet instanceof UnloadChunkS2CPacket unload) {
+            SecondaryWorldManager.onStreamedUnload(payload.dimension(), unload.pos());
         }
 
         SecondaryWorldManager.withWorld(target, () -> applyTo(packet, client));

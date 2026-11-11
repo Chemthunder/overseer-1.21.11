@@ -4,6 +4,7 @@ import net.damagejr05.overseer.core.client.ClientDebugCommand;
 import net.damagejr05.overseer.core.client.PacketRedirectionClient;
 import net.damagejr05.overseer.core.client.PortalTransitionClient;
 import net.damagejr05.overseer.core.client.SecondaryWorldManager;
+import net.damagejr05.overseer.core.client.render.MemoryAtmosphere;
 import net.damagejr05.overseer.core.client.render.MemorySkyRenderer;
 import net.damagejr05.overseer.core.client.render.PortalViewCompositor;
 import net.damagejr05.overseer.core.client.render.PortalViewRenderer;
@@ -22,14 +23,21 @@ public class OverseerClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(minecraftClient -> SecondaryWorldManager.tick());
 
         // Secondary worlds hold a reference to the network handler, so they must not outlive it.
+        // The renderers hold references to worlds and to render targets, and must not either.
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             SecondaryWorldManager.clear();
             PortalTransitionClient.clear();
+            PortalViewRenderer.reset();
+            PortalViewCompositor.reset();
+            MemoryAtmosphere.reset();
         });
 
         ResourceLoader.get(ResourceType.CLIENT_RESOURCES).registerReloader(
                 Overseer.id("secondary_worlds"),
-                (SynchronousResourceReloader) manager -> SecondaryWorldManager.onResourcesReloaded()
+                (SynchronousResourceReloader) manager -> {
+                    SecondaryWorldManager.onResourcesReloaded();
+                    MemoryAtmosphere.onResourcesReloaded();
+                }
         );
 
         PacketRedirectionClient.init();
