@@ -26,4 +26,20 @@ void main() {
 
     clipPos = ProjMat * ModelViewMat * vec4(Position, 1.0);
     gl_Position = clipPos;
+
+    // Two kinds of surface are drawn pressed against the lens rather than where they stand: one
+    // the camera is about to walk through, which the near plane would otherwise cut a hole in,
+    // and the mask over a doorway's opening, which has to be in front of whatever follows it.
+    // The alpha of the vertex colour says which kind this is; see the compositor.
+    //
+    // Putting z on the near plane does it. The position on screen is untouched, the depth comes
+    // out as near as depth goes, and since the near plane can no longer cut the surface it is
+    // clipped only where it passes behind the camera itself. Just inside the plane rather than
+    // on it, so that rounding cannot put it outside.
+    bool pressed = Color.a > 0.90 && Color.a < 0.975;
+    bool mask = Color.a > 0.65 && Color.a < 0.75;
+
+    if (pressed || mask) {
+        gl_Position.z = -gl_Position.w * 0.9999;
+    }
 }

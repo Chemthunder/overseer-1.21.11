@@ -98,8 +98,35 @@ public class PortalViewCompositor {
     /** Faces per portal: the aperture, and three bands of four faces for each of two recesses. */
     private static final int FACES = 25;
 
-    /** Marks the full-screen fill in the vertex colour's alpha; see the shader. */
-    private static final float FULLSCREEN_FLAG = 0.8F;
+    /**
+     * What kind of surface a vertex belongs to, carried in the vertex colour's alpha and read by
+     * both shaders.
+     *
+     * <ul>
+     *   <li>{@link #ORDINARY} -- drawn where it is, shaded as what it is.</li>
+     *   <li>{@link #PRESSED} -- shaded the same, but drawn in front of everything, as though
+     *       pressed against the lens. For a surface the camera is close enough to that the near
+     *       plane would otherwise cut a hole in it.</li>
+     *   <li>{@link #FULLSCREEN} -- the far side, plain, for the quad that covers the screen
+     *       while the camera is beyond a doorway.</li>
+     *   <li>{@link #MASK} -- nothing at all, in front of everything: it draws no colour and
+     *       leaves the depth buffer saying something is there, so that whatever is drawn after
+     *       it stays off that part of the screen.</li>
+     * </ul>
+     *
+     * <p>The values are spaced widely enough to survive being stored in a byte.
+     */
+    private static final float ORDINARY = 1.0F;
+    private static final float PRESSED = 0.95F;
+    private static final float FULLSCREEN = 0.8F;
+    private static final float MASK = 0.7F;
+
+    /**
+     * How close to a doorway's plane the camera has to be for its surface to be drawn pressed, in
+     * blocks. Comfortably more than the reach of the near plane at the corners of the widest
+     * field of view, and close enough that nothing could be standing in between.
+     */
+    private static final double PRESS_DISTANCE = 0.3;
 
     /** Doorways that have been drawn with no live view behind them. */
     private static final java.util.Set<PortalAnchor> SEEN_WITHOUT_VIEW = new java.util.HashSet<>();
@@ -217,37 +244,21 @@ public class PortalViewCompositor {
 
         int stride = VertexFormats.POSITION_TEXTURE_COLOR.getVertexSize();
 
-        boolean through = PortalViewRenderer.isThrough();
         DoorwayComponent doorways = DoorwayComponent.get(client.world);
 
-        // The doorway the camera is still coming out of keeps its frame and loses its surface;
-        // see PortalViewRenderer.isEmerging. Asked once, so the count and the geometry agree.
-        PortalAnchor emerging = null;
-
-        int quads = through ? 1 : 0;
-        for (PortalAnchor portal : portals) {
-            boolean open = PortalViewRenderer.isEmerging(portal);
-            if (open) {
-                emerging = portal;
-            }
-
-            if (doorways.isEvictionAnchor(portal)) {
-                quads += open ? 0 : 1;
-            } else {
-                quads += open ? FACES - 1 : FACES;
-            }
-        }
-
-        if (quads == 0) {
-            return;
-        }
+        // The doorway the camera is on the far side of, if it is; see PortalViewRenderer.through.
+        // And whether there is a view of the other world to put round its opening.
+        PortalAnchor passed = PortalViewRenderer.throughAnchor();
+        boolean around = passed != null && PortalViewRenderer.isThrough() && !doorways.isEvictionAnchor(passed);
 
         // The eviction's portal opens inside the eye's pupil, and is whatever size that is.
         int evicting = doorways.evictionTicks();
         float skyScale = evicting == 0 ? 0.0F
                 : Eviction.portalScale(evicting + client.getRenderTickCounter().getTickProgress(false));
 
-        try (BufferAllocator allocator = new BufferAllocator(4 * quads * stride)) {
+        // Room for every face of every doorway and the quad over the screen; fewer are usually
+        // drawn, and the count that matters is taken from what was actually built.
+        try (BufferAllocator allocator = new BufferAllocator(4 * (portals.size() * FACES + 1) * stride)) {
             BufferBuilder builder = new BufferBuilder(
                     allocator,
                     VertexFormat.DrawMode.QUADS,
@@ -270,26 +281,40 @@ public class PortalViewCompositor {
                     SEEN_WITHOUT_VIEW.add(portal);
                 }
 
-                boolean open = portal.equals(emerging);
-
-                if (doorways.isEvictionAnchor(portal)) {
-                    // Frameless, so with no surface there is nothing left of it to draw.
-                    if (!open) {
-                        emitRound(builder, portal, camera, view, skyScale);
-                    }
+                // Left until every other doorway has been drawn; see below.
+                if (portal.equals(passed)) {
                     continue;
                 }
 
-                emitPortal(builder, portal, camera, view, isDynamic ? easeOutBack(opening) : 1.0F, !open);
+                if (doorways.isEvictionAnchor(portal)) {
+                    emitRound(builder, portal, camera, view, skyScale);
+                    continue;
+                }
+
+                emitPortal(builder, portal, camera, view, isDynamic ? easeOutBack(opening) : 1.0F);
             }
 
-            // Last, and nearer than anything else, so it covers the doorway it is passing through.
-            if (through) {
+            // The doorway the camera is on the far side of goes after all the others, because
+            // its opening is a mask and a mask stops whatever is drawn after it: another doorway
+            // standing in view through that opening has to be on screen already. One an eviction
+            // opened is frameless, so from its far side there is nothing of it to draw at all.
+            if (passed != null && portals.contains(passed) && !doorways.isEvictionAnchor(passed)) {
+                boolean isDynamic = dynamic != null
+                        && (passed.equals(dynamic.outer()) || passed.equals(dynamic.inner()));
+
+                emitPassed(builder, passed, camera, isDynamic ? easeOutBack(opening) : 1.0F, around);
+            }
+
+            // Last of all, behind that opening and its frame and in front of everything else:
+            // the other world, wherever the camera is not looking back through.
+            if (around) {
                 emitFullscreen(builder, client);
             }
 
-            try (BuiltBuffer built = builder.end()) {
-                draw(client, built, target, quads);
+            try (BuiltBuffer built = builder.endNullable()) {
+                if (built != null) {
+                    draw(client, built, target, built.getDrawParameters().vertexCount() / 4);
+                }
             }
         } catch (Throwable e) {
             Overseer.LOGGER.error("Portal composite failed", e);
@@ -342,8 +367,7 @@ public class PortalViewCompositor {
      * <p>Everything is camera-relative, matching the space world geometry is drawn in. Culling is
      * off for this material, so winding does not matter.
      */
-    private static void emitPortal(BufferBuilder builder, PortalAnchor entry, Vec3d camera, float viewFlag,
-                                   float scale, boolean surface) {
+    private static void emitPortal(BufferBuilder builder, PortalAnchor entry, Vec3d camera, float viewFlag, float scale) {
         // Never quite zero: a degenerate quad is harmless, but its UVs feed a division.
         scale = Math.max(scale, 0.001F);
 
@@ -354,11 +378,8 @@ public class PortalViewCompositor {
         Vec3d right = entry.right();
         Vec3d out = entry.normal();
 
-        // The view surface, at the narrow end of the splay. On the anchor plane, except when the
-        // camera is about to pass through it: then it backs away, so that the near plane never
-        // gets the chance to cut a hole in it. See PortalGeometry.
-        Vec3d[] view = ring(centre, right, halfWidth, halfHeight, SPLAY_INSET * scale,
-                out.multiply(PortalGeometry.retreat(entry, camera)));
+        // The view surface, on the anchor plane, at the narrow end of the splay.
+        Vec3d[] view = ring(centre, right, halfWidth, halfHeight, SPLAY_INSET * scale, Vec3d.ZERO);
 
         // UVs in blocks from the surface's own centre. The shader measures its rim and edge
         // shading in blocks, so they keep the same thickness whatever size the opening is, and it
@@ -366,12 +387,18 @@ public class PortalViewCompositor {
         float u = (float) (halfWidth - SPLAY_INSET * scale);
         float v = (float) (halfHeight - SPLAY_INSET * scale / 2.0);
 
-        if (surface) {
-            aperture(builder, view[0], -u, -v, viewFlag);
-            aperture(builder, view[1], u, -v, viewFlag);
-            aperture(builder, view[2], u, v, viewFlag);
-            aperture(builder, view[3], -u, v, viewFlag);
-        }
+        // A camera about to walk through the surface comes closer to it than the near plane
+        // does, and a surface nearer than the near plane is cut away: for the last frame or two
+        // before stepping through, the corners of the screen showed what was behind the doorway.
+        // Drawn pressed it cannot be cut. It stays exactly where it is on screen -- an earlier
+        // answer to this moved the surface back out of reach, and the threshold could be seen
+        // sliding along the floor ahead of anyone who looked down.
+        float kind = isAtSurface(entry, camera) ? PRESSED : ORDINARY;
+
+        aperture(builder, view[0], -u, -v, viewFlag, kind);
+        aperture(builder, view[1], u, -v, viewFlag, kind);
+        aperture(builder, view[2], u, v, viewFlag, kind);
+        aperture(builder, view[3], -u, v, viewFlag, kind);
 
         // A recess out to each face of the block. Both are emitted every frame and the depth test
         // picks: the aperture is opaque and spans the whole opening, so the recess on the far side
@@ -379,8 +406,60 @@ public class PortalViewCompositor {
         //
         // That is the point of drawing both. Choosing one by which side the camera is on made the
         // doorway visibly turn itself inside out at the moment you crossed its plane.
-        recess(builder, centre, right, out, halfWidth, halfHeight, scale, view, viewFlag);
-        recess(builder, centre, right, out.negate(), halfWidth, halfHeight, scale, view, viewFlag);
+        recess(builder, centre, right, out, halfWidth, halfHeight, scale, view, viewFlag, ORDINARY);
+        recess(builder, centre, right, out.negate(), halfWidth, halfHeight, scale, view, viewFlag, ORDINARY);
+    }
+
+    /** Whether the camera is in the opening and nearly at its surface, from either side. */
+    private static boolean isAtSurface(PortalAnchor entry, Vec3d camera) {
+        Vec3d local = camera.subtract(entry.center());
+
+        return Math.abs(local.dotProduct(entry.normal())) < PRESS_DISTANCE
+                && Math.abs(local.dotProduct(entry.right())) < entry.width() / 2.0 + 0.1
+                && Math.abs(local.y) < entry.height() / 2.0 + 0.1;
+    }
+
+    /**
+     * A doorway the camera is on the far side of: part-way through a crossing, with the world
+     * being drawn and the side of the plane it is on not yet agreeing.
+     *
+     * <p>From here the doorway has no surface. The opening is the way back, and through it the
+     * camera sees the world this frame was drawn in, which is already on screen; everywhere else
+     * it sees the other one. So the opening is drawn as a mask, the frame on the camera's side
+     * of it is drawn pressed so that it stays in front, and the caller then lays the other world
+     * over the whole screen behind both.
+     *
+     * <p>Without a view of the other world to lay over it there is nothing to mask, and the
+     * doorway is simply drawn as an empty frame.
+     */
+    private static void emitPassed(BufferBuilder builder, PortalAnchor entry, Vec3d camera, float scale, boolean around) {
+        scale = Math.max(scale, 0.001F);
+
+        double halfWidth = (entry.width() / 2.0 - INSET) * scale;
+        double halfHeight = (entry.height() / 2.0 - INSET) * scale;
+
+        Vec3d centre = entry.center().subtract(camera);
+        Vec3d right = entry.right();
+        Vec3d out = entry.normal();
+
+        Vec3d[] view = ring(centre, right, halfWidth, halfHeight, SPLAY_INSET * scale, Vec3d.ZERO);
+
+        if (!around) {
+            recess(builder, centre, right, out, halfWidth, halfHeight, scale, view, 0.0F, ORDINARY);
+            recess(builder, centre, right, out.negate(), halfWidth, halfHeight, scale, view, 0.0F, ORDINARY);
+            return;
+        }
+
+        // First, so that everything after it loses to it.
+        for (Vec3d corner : view) {
+            vertex(builder, corner, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, MASK);
+        }
+
+        // Only the half of the frame the camera is standing in. The other half lies beyond the
+        // opening, where the mask has already said nothing more is to be drawn -- and where,
+        // once the crossing has finished, the view of that world will not have it either.
+        Vec3d towardCamera = entry.signedDistance(camera) >= 0.0 ? out : out.negate();
+        recess(builder, centre, right, towardCamera, halfWidth, halfHeight, scale, view, 0.0F, PRESSED);
     }
 
     /**
@@ -408,7 +487,7 @@ public class PortalViewCompositor {
 
     /** As {@link #aperture}, with red at one half: the shader's cue to cut a circle. */
     private static void round(BufferBuilder builder, Vec3d pos, float u, float v, float viewFlag) {
-        vertex(builder, pos, u, v, 0.5F, 0.0F, viewFlag);
+        vertex(builder, pos, u, v, 0.5F, 0.0F, viewFlag, ORDINARY);
     }
 
     /**
@@ -432,7 +511,8 @@ public class PortalViewCompositor {
 
     /** One side's worth of opening: lip, ledge and splay, from a face of the block in to the view. */
     private static void recess(BufferBuilder builder, Vec3d centre, Vec3d right, Vec3d out,
-                               double halfWidth, double halfHeight, float scale, Vec3d[] view, float viewFlag) {
+                               double halfWidth, double halfHeight, float scale, Vec3d[] view, float viewFlag,
+                               float kind) {
         double depth = DEPTH - INSET;
         float lipEnd = (float) (LIP_DEPTH / depth);
 
@@ -443,9 +523,9 @@ public class PortalViewCompositor {
         // Recess depth runs 0 at the lip to 1 at the aperture, and the shader shades along it.
         // The second number is how much brighter a band is for facing the viewer: the lip is
         // square to the wall, the ledge faces straight out, and the splay is somewhere between.
-        band(builder, lip, lipBack, 0.0F, lipEnd, 0.0F, viewFlag);
-        band(builder, lipBack, ledge, lipEnd, lipEnd, 0.30F, viewFlag);
-        band(builder, ledge, view, lipEnd, 1.0F, 0.12F, viewFlag);
+        band(builder, lip, lipBack, 0.0F, lipEnd, 0.0F, viewFlag, kind);
+        band(builder, lipBack, ledge, lipEnd, lipEnd, 0.30F, viewFlag, kind);
+        band(builder, ledge, view, lipEnd, 1.0F, 0.12F, viewFlag, kind);
     }
 
     /**
@@ -457,15 +537,16 @@ public class PortalViewCompositor {
      * as a flat border -- it is the difference between them that reads as depth.
      */
     private static void band(BufferBuilder builder, Vec3d[] outer, Vec3d[] inner,
-                             float outerDepth, float innerDepth, float facing, float viewFlag) {
-        wall(builder, outer[0], outer[1], inner[1], inner[0], outerDepth, innerDepth, FLOOR_LIGHT, viewFlag);
-        wall(builder, outer[3], outer[2], inner[2], inner[3], outerDepth, innerDepth, CEILING_LIGHT + facing, viewFlag);
-        wall(builder, outer[0], outer[3], inner[3], inner[0], outerDepth, innerDepth, SIDE_LIGHT_A + facing, viewFlag);
-        wall(builder, outer[1], outer[2], inner[2], inner[1], outerDepth, innerDepth, SIDE_LIGHT_B + facing, viewFlag);
+                             float outerDepth, float innerDepth, float facing, float viewFlag, float kind) {
+        wall(builder, outer[0], outer[1], inner[1], inner[0], outerDepth, innerDepth, FLOOR_LIGHT, viewFlag, kind);
+        wall(builder, outer[3], outer[2], inner[2], inner[3], outerDepth, innerDepth, CEILING_LIGHT + facing, viewFlag, kind);
+        wall(builder, outer[0], outer[3], inner[3], inner[0], outerDepth, innerDepth, SIDE_LIGHT_A + facing, viewFlag, kind);
+        wall(builder, outer[1], outer[2], inner[2], inner[1], outerDepth, innerDepth, SIDE_LIGHT_B + facing, viewFlag, kind);
     }
 
     /**
-     * Covers the screen with the far view while the camera is passing through a doorway.
+     * Covers the screen with the far view while the camera is on the far side of a doorway. The
+     * opening itself has been masked by then and is left alone; see {@link #emitPassed}.
      *
      * <p>A quad just beyond the near plane, squarely in front of the camera and far larger than
      * the view. It samples by screen position like the aperture does, so its exact size and
@@ -488,7 +569,7 @@ public class PortalViewCompositor {
     private static void fullscreen(BufferBuilder builder, Vec3d pos) {
         builder.vertex((float) pos.x, (float) pos.y, (float) pos.z)
                 .texture(0.0F, 0.0F)
-                .color(1.0F, 0.0F, 1.0F, FULLSCREEN_FLAG);
+                .color(1.0F, 0.0F, 1.0F, FULLSCREEN);
     }
 
     private static final float FLOOR_LIGHT = 1.0F;
@@ -503,20 +584,20 @@ public class PortalViewCompositor {
      * Both reach the shader as constants across the face; see the vertex shader for how.
      */
     private static void wall(BufferBuilder builder, Vec3d lipA, Vec3d lipB, Vec3d backB, Vec3d backA,
-                             float lipDepth, float backDepth, float light, float viewFlag) {
+                             float lipDepth, float backDepth, float light, float viewFlag, float kind) {
         // The outer edge's length for all four corners, though a splayed face is shorter at the
         // back: the shader needs the same value at every corner to read it as a constant.
         float half = (float) (lipA.distanceTo(lipB) / 2.0);
         light = Math.min(light, 1.0F);
 
-        vertex(builder, lipA, -half, light, lipDepth, 1.0F, viewFlag);
-        vertex(builder, lipB, half, light, lipDepth, 1.0F, viewFlag);
-        vertex(builder, backB, half, light, backDepth, 1.0F, viewFlag);
-        vertex(builder, backA, -half, light, backDepth, 1.0F, viewFlag);
+        vertex(builder, lipA, -half, light, lipDepth, 1.0F, viewFlag, kind);
+        vertex(builder, lipB, half, light, lipDepth, 1.0F, viewFlag, kind);
+        vertex(builder, backB, half, light, backDepth, 1.0F, viewFlag, kind);
+        vertex(builder, backA, -half, light, backDepth, 1.0F, viewFlag, kind);
     }
 
-    private static void aperture(BufferBuilder builder, Vec3d pos, float u, float v, float viewFlag) {
-        vertex(builder, pos, u, v, 1.0F, 0.0F, viewFlag);
+    private static void aperture(BufferBuilder builder, Vec3d pos, float u, float v, float viewFlag, float kind) {
+        vertex(builder, pos, u, v, 1.0F, 0.0F, viewFlag, kind);
     }
 
     /**
@@ -529,15 +610,15 @@ public class PortalViewCompositor {
      *   <li>green — 1 on a side face, 0 on the aperture</li>
      *   <li>blue — how far the live see-through view has faded in over the procedural aperture,
      *       0 when there is none</li>
-     *   <li>alpha — 1 normally, one half for the flat diagnostic fill, and
-     *       {@link #FULLSCREEN_FLAG} for the full-screen view shown while passing through</li>
+     *   <li>alpha — what kind of surface it is: see {@link #ORDINARY} and the rest. One half is
+     *       the flat diagnostic fill.</li>
      * </ul>
      */
     private static void vertex(BufferBuilder builder, Vec3d pos, float u, float v,
-                               float recess, float isWall, float viewFlag) {
+                               float recess, float isWall, float viewFlag, float kind) {
         builder.vertex((float) pos.x, (float) pos.y, (float) pos.z)
                 .texture(u, v)
-                .color(recess, isWall, viewFlag, PortalViewRenderer.isSolidDebug() ? 0.5F : 1.0F);
+                .color(recess, isWall, viewFlag, PortalViewRenderer.isSolidDebug() && kind != MASK ? 0.5F : kind);
     }
 
     private static void draw(MinecraftClient client, BuiltBuffer built, ManagedRenderTarget target, int quadCount) {

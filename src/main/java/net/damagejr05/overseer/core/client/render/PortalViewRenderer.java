@@ -112,95 +112,85 @@ public class PortalViewRenderer {
     }
 
     /**
-     * The doorway the camera has passed through but the server has not yet moved the player for.
+     * The doorway whose plane the camera is on the far side of, when it is.
      *
-     * <p>The crossing is decided on the server, once a tick, and the answer then has to travel
-     * back. For those few frames the camera is already beyond the opening: the surface it was
-     * looking into is behind it, and what is in front is whatever stands behind the doorway in
-     * the world it is about to leave -- usually the inside of a wall. That is a flash of the wrong
-     * place in the middle of every crossing.
+     * <p>A player's step through a doorway happens at three different moments. The camera goes
+     * through the plane on some frame. The player's body goes through it on some tick, which the
+     * server notices and answers by moving them to the other world. And that answer arrives, a
+     * round trip later. The camera is drawn part-way between the body's last two positions and so
+     * runs up to a tick behind it; the answer can come before the camera has crossed or well
+     * after. So there is always a stretch of frames in which the world being drawn and the side
+     * of the doorway the camera is on do not match:
      *
-     * <p>While this is set, the far side is rendered without the portal-plane clip, which would
-     * now cut away everything in front of the camera, and the compositor fills the whole screen
-     * with it. The picture is then the same one the player gets a moment later when the
-     * dimension change lands, so the handover has nothing to show.
+     * <ul>
+     *   <li>the camera is through and the player has not been moved yet -- it is beyond the
+     *       doorway, still in the world it has left; or</li>
+     *   <li>the player has been moved and the camera has not caught up -- it is still short of
+     *       the doorway they came out of, already in the world it has not reached.</li>
+     * </ul>
+     *
+     * <p>Seen from the doorway these are one situation, and what the camera ought to see is the
+     * same in both: the other world in every direction, except back through the opening, where
+     * it sees this one. While this is set the far side is therefore rendered without the
+     * portal-plane clip, which would otherwise cut away everything in front of the camera, and
+     * the compositor draws it over the whole screen <em>apart from the opening</em>, which it
+     * leaves showing the world underneath.
+     *
+     * <p>The opening is the part that matters. It used to be filled along with the rest, which
+     * is right for someone walking in forwards -- the opening is behind them -- and wrong for
+     * anyone backing in, who is still looking out through it at the place they are leaving.
+     * Backing through a doorway showed that place, then a few frames of the far side of the
+     * other doorway, then the same place again.
      */
     private static @Nullable PortalAnchor through = null;
+
+    /** The side of {@link #through} the camera will be back on when this is over. */
     private static boolean throughFromFront = false;
     private static long throughSince = 0L;
 
-    /** How long to hold the full-screen view waiting for the server, in milliseconds. */
+    /** How long to hold this for before deciding nothing is coming, in milliseconds. */
     private static final long THROUGH_TIMEOUT_MS = 750L;
+
+    /**
+     * The doorway the player has just been moved out of, and which side of it they are on, until
+     * the next frame takes it up. The second case above cannot be seen from the camera's own
+     * movement: the camera has not crossed anything in the world it has just arrived in.
+     */
+    private static @Nullable PortalAnchor arrival = null;
+    private static boolean arrivalToFront = true;
 
     /** Signed distance of the camera from each doorway last frame, to see it change sign. */
     private static final Map<PortalAnchor, Double> LAST_DISTANCE = new HashMap<>();
     private static @Nullable Vec3d lastCameraPos = null;
     private static @Nullable ClientWorld lastWorld = null;
 
-    /** True when this frame's view should cover the screen rather than fill an aperture. */
+    /**
+     * True when this frame's view of the far side should cover the screen around the opening
+     * rather than fill it.
+     */
     public static boolean isThrough() {
         return through != null && valid && through.equals(renderedEntry);
     }
 
     /**
-     * The doorway the player has just come out of, until the camera has come out of it too.
-     *
-     * <p>The camera does not sit at the player's position. It is drawn part-way between where
-     * the player was last tick and where they are now, so it runs up to a tick behind -- and the
-     * server's answer to a crossing can arrive inside that tick. The player is then through, and
-     * for the next few frames the camera, following smoothly on behind, is not: it is still on
-     * the wrong side of the plane of the doorway it is emerging from.
-     *
-     * <p>Nothing about that is wrong, but two things here used to misread it. The doorway's
-     * surface was drawn in front of the camera, showing the place just left. And when the camera
-     * did reach the plane a moment later, that looked exactly like someone walking into the
-     * doorway, so the whole screen was filled with the far side -- the place just left again --
-     * until the wait for a crossing that was never coming timed out. Stepping through showed the
-     * new world, then the old one for most of a second, then the new one.
-     *
-     * <p>While this is set that doorway's surface is not drawn and its plane is not watched. The
-     * camera finishes coming through an open frame, which is what the frame before showed.
+     * The doorway the camera is on the far side of, whether or not there is a view to show for
+     * it. Its own surface must not be drawn either way: that surface faces the side the camera
+     * has left, and from here it would be a wall across the opening.
      */
-    private static @Nullable PortalAnchor emerging = null;
-    private static boolean emergingToFront = true;
-    private static long emergingSince = 0L;
-
-    /** Longer than any camera takes to catch up; only there so that a missed end cannot stick. */
-    private static final long EMERGE_TIMEOUT_MS = 1_000L;
+    public static @Nullable PortalAnchor throughAnchor() {
+        return through;
+    }
 
     /**
      * The player has been carried out of {@code exit} and now stands at {@code position}, with
      * the camera still to follow.
      */
     public static void arrivedThrough(PortalAnchor exit, Vec3d position) {
-        emerging = exit;
-        emergingToFront = exit.signedDistance(position) >= 0.0;
-        emergingSince = System.currentTimeMillis();
+        arrival = exit;
+        arrivalToFront = exit.signedDistance(position) >= 0.0;
     }
 
-    /** Whether the camera is still coming out of {@code anchor} after a crossing. */
-    public static boolean isEmerging(PortalAnchor anchor) {
-        return emerging != null && emerging.equals(anchor)
-                && System.currentTimeMillis() - emergingSince <= EMERGE_TIMEOUT_MS;
-    }
-
-    /** End the emergence once the camera is out on the side the player came out on. */
-    private static void trackEmergence(ClientWorld world, Vec3d cameraPos) {
-        if (emerging == null) {
-            return;
-        }
-
-        double distance = emerging.signedDistance(cameraPos);
-        boolean out = emergingToFront ? distance > 0.0 : distance < 0.0;
-
-        if (out || emerging.dimension() != world.getRegistryKey()
-                || System.currentTimeMillis() - emergingSince > EMERGE_TIMEOUT_MS) {
-            emerging = null;
-        }
-    }
-
-    private static void trackCrossing(MinecraftClient client, ClientWorld world, Vec3d cameraPos,
-                                      @Nullable PortalAnchor emergingFrom) {
+    private static void trackCrossing(MinecraftClient client, ClientWorld world, Vec3d cameraPos) {
         // A new world means the crossing happened. Nothing measured in the old one carries over.
         if (world != lastWorld) {
             lastWorld = world;
@@ -209,9 +199,23 @@ public class PortalViewRenderer {
             LAST_DISTANCE.clear();
         }
 
-        // Only someone the server will actually move, and only in first person: in third person
-        // the camera trails the body and crosses the plane at a different moment from it.
-        boolean willCross = client.options.getPerspective().isFirstPerson()
+        // Only in first person: in third person the camera trails the body and is on whichever
+        // side of the plane it likes.
+        boolean firstPerson = client.options.getPerspective().isFirstPerson();
+
+        if (arrival != null) {
+            // Taken up after the reset above, which is for the world this arrived in.
+            if (firstPerson && arrival.dimension() == world.getRegistryKey()) {
+                through = arrival;
+                throughFromFront = arrivalToFront;
+                throughSince = System.currentTimeMillis();
+            }
+
+            arrival = null;
+        }
+
+        // And only someone the server will actually move.
+        boolean willCross = firstPerson
                 && client.player != null
                 && DoorwayComponent.get(world).mayEnter(client.player);
 
@@ -222,13 +226,6 @@ public class PortalViewRenderer {
             Double before = LAST_DISTANCE.put(anchor, distance);
 
             if (before == null || lastCameraPos == null || through != null || !willCross) {
-                continue;
-            }
-
-            // The camera reaching this plane is the end of the crossing just made, not the
-            // start of another. Its distance is still recorded above, so that turning straight
-            // round and walking back in is measured from the right side.
-            if (anchor.equals(emergingFrom)) {
                 continue;
             }
 
@@ -248,7 +245,8 @@ public class PortalViewRenderer {
         if (through != null) {
             double distance = through.signedDistance(cameraPos);
 
-            // Stepped back out, wandered off, or the server never agreed there was a crossing.
+            // Back on the side it belongs on -- stepped back out, or caught up with the player --
+            // or wandered off, or the server never agreed there was a crossing.
             if (!visible.contains(through)
                     || (distance > 0.0) == throughFromFront
                     || Math.abs(distance) > 2.0
@@ -364,7 +362,7 @@ public class PortalViewRenderer {
      * the camera is passing through it, and whenever any corner is level with or behind the
      * camera, where a screen position means nothing.
      */
-    private static void chooseCrop(PortalAnchor entry, boolean round, boolean wholeScreen, Vec3d cameraPos,
+    private static void chooseCrop(PortalAnchor entry, boolean wholeScreen, Vec3d cameraPos,
                                    Matrix4f view, Matrix4f projection, int screenWidth, int screenHeight) {
         if (!entry.equals(cropAnchor)) {
             cropAnchor = entry;
@@ -375,12 +373,7 @@ public class PortalViewRenderer {
         float left = -1.0F, right = 1.0F, bottom = -1.0F, top = 1.0F;
 
         if (!wholeScreen && cropEnabled) {
-            // The surface as the compositor will draw it, which near the plane is not on it.
             Vec3d centre = entry.center().subtract(cameraPos);
-            if (!round) {
-                centre = centre.add(entry.normal().multiply(PortalGeometry.retreat(entry, cameraPos)));
-            }
-
             Vec3d across = entry.right().multiply(entry.width() / 2.0);
             double up = entry.height() / 2.0;
 
@@ -505,7 +498,7 @@ public class PortalViewRenderer {
         visible.clear();
 
         through = null;
-        emerging = null;
+        arrival = null;
         LAST_DISTANCE.clear();
         lastCameraPos = null;
         lastWorld = null;
@@ -759,18 +752,13 @@ public class PortalViewRenderer {
         // Everything in this dimension gets drawn, from any angle.
         visible.addAll(doorways.anchorsIn(world.getRegistryKey()));
 
-        // Whether or not the live view is on: the procedural aperture gets in the way of an
-        // emerging camera just the same. Taken before it is updated, because the frame on which
-        // the camera comes out is the very one the crossing test must not see.
-        Vec3d cameraPos = client.gameRenderer.getCamera().getCameraPos();
-        PortalAnchor emergingFrom = emerging;
-        trackEmergence(world, cameraPos);
+        // Whether or not the live view is on: a doorway's surface must not be drawn across the
+        // opening for a camera on the far side of it, and that is as true of the procedural one.
+        trackCrossing(client, world, client.gameRenderer.getCamera().getCameraPos());
 
         if (!enabled) {
             return;
         }
-
-        trackCrossing(client, world, cameraPos, emergingFrom);
 
         // The doorway being walked through, if there is one; otherwise the nearest on screen.
         PortalTransform transform = null;
@@ -808,7 +796,7 @@ public class PortalViewRenderer {
 
         Framebuffer screen = client.getFramebuffer();
         chooseCrop(
-                transform.from(), doorways.isEvictionAnchor(transform.from()), passingThrough,
+                transform.from(), passingThrough,
                 client.gameRenderer.getCamera().getCameraPos(), framePositionMatrix, frameBasicProjection,
                 screen.textureWidth, screen.textureHeight
         );

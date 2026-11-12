@@ -176,8 +176,16 @@ void main() {
         return;
     }
 
-    // Passing through: the camera is beyond the doorway and the server has not caught up. The
-    // far view fills the screen, plain, exactly as it will look once the crossing lands.
+    // The opening of a doorway the camera is on the far side of. Nothing is drawn: the world
+    // already on screen is what is seen through it. All this leaves behind is its depth, which
+    // keeps the fill below off this part of the screen.
+    if (tint.a < 0.75) {
+        fragColor = vec4(0.0);
+        return;
+    }
+
+    // Beyond a doorway, part-way through a crossing: the other world, plain, over everything but
+    // that opening, exactly as it will look once the crossing has finished.
     if (tint.a < 0.9) {
         fragColor = vec4(texture(PortalView, clamp(viewUv(screenUv()), 0.0, 1.0)).rgb, 1.0);
         return;

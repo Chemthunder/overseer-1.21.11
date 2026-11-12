@@ -153,6 +153,11 @@ public final class CrossingContinuity {
         to.setVelocity(transform.applyVector(from.getVelocity()));
         to.setOnGround(from.isOnGround());
 
+        // A new player is not flying until the server says so, a packet or two later. If a tick
+        // falls in between, someone flying through drops for it, and the view narrows and
+        // widens again as the game takes the flying field of view away and gives it back.
+        to.getAbilities().flying = from.getAbilities().flying;
+
         to.bodyYaw = from.bodyYaw + turn;
         to.lastBodyYaw = from.lastBodyYaw + turn;
         to.headYaw = from.headYaw + turn;
